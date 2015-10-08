@@ -40,8 +40,12 @@ install: $(addprefix install/,$(LIB).la)
 	mkdir -p $(IINCDIR) && install -c $(INCS) $(IINCDIR)
 	#mkdir -p $(IMANDIR) && install -c $(MANS) $(IMANDIR)
 
+test: tests.o
+	$(CC) $(CFLAGS) $< -o masstree_test
+	./masstree_test
+
 clean:
 	libtool --mode=clean rm
-	@ rm -rf .libs *.o *.lo *.la
+	rm -rf .libs *.o *.lo *.la masstree_test
 
-.PHONY: all lib install clean
+.PHONY: all lib install test clean

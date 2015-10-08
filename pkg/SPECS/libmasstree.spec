@@ -16,6 +16,9 @@ Masstree is a lockless cache-aware trie of B+ trees.
 %prep
 %setup -q -n src
 
+%check
+make test
+
 %build
 make %{?_smp_mflags} LIBDIR=%{_libdir}
 
