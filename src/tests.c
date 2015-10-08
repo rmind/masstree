@@ -116,12 +116,41 @@ inode_ops_test(void)
 	unlock_node(node);
 }
 
+/*
+ * Random insert/lookup/check test.
+ */
+
+static void
+random_keyval_test(void)
+{
+	for (unsigned s = 1; s <= 100; s++) {
+		masstree_t *tree = masstree_create(&ops);
+		size_t n = 10000, i = n;
+
+		srandom(s);
+		while (--i) {
+			unsigned long val = random(), key = random() % 1000;
+			void *pval = (void *)(uintptr_t)val, *pkey = &key;
+
+			masstree_put(tree, pkey, sizeof(key), pval);
+			pval = masstree_get(tree, pkey, sizeof(key));
+
+			if ((unsigned long)(uintptr_t)pval != val) {
+				printf("%llx, %llx, %u\n", val, key, n - i);
+				abort();
+			}
+		}
+	}
+}
+
 int
 main(void)
 {
 	node_locking_test();
 	leaf_ops_test();
 	inode_ops_test();
+
+	random_keyval_test();
 
 	puts("ok");
 	return 0;

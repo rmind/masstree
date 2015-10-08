@@ -7,6 +7,13 @@ CFLAGS+=	-Wstrict-prototypes -Wmissing-prototypes -Wpointer-arith
 CFLAGS+=	-Wshadow -Wcast-qual -Wwrite-strings
 
 ifeq ($(DEBUG),1)
+DEBUG=		1
+endif
+ifeq ($(MAKECMDGOALS),test)
+DEBUG=		1
+endif
+
+ifdef DEBUG
 CFLAGS+=	-O1 -DDEBUG -fno-omit-frame-pointer
 else
 CFLAGS+=	-DNDEBUG
@@ -41,7 +48,7 @@ install: $(addprefix install/,$(LIB).la)
 	#mkdir -p $(IMANDIR) && install -c $(MANS) $(IMANDIR)
 
 test: tests.o
-	$(CC) $(CFLAGS) $< -o masstree_test
+	$(CC) -O0 -g -W -Wall $< -o masstree_test
 	./masstree_test
 
 clean:
