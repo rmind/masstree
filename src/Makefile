@@ -14,7 +14,7 @@ DEBUG=		1
 endif
 
 ifdef DEBUG
-CFLAGS+=	-O1 -DDEBUG -fno-omit-frame-pointer
+CFLAGS+=	-O0 -DDEBUG -fno-omit-frame-pointer
 else
 CFLAGS+=	-DNDEBUG
 LDFLAGS=	-flto

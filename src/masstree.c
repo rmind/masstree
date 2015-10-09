@@ -31,9 +31,10 @@
  *
  *	http://pdos.csail.mit.edu/papers/masstree:eurosys12.pdf
  *
+ * Some notes:
+ *
  * - Keys are sliced into 64-bits per layer of the trie.
  * - Each layer is a B+ tree with fanout 16.
- * - Optimistic concurrency.
  *
  * Concurrency in a nutshell:
  *
@@ -117,7 +118,7 @@ typedef struct {
 
 /*
  * The interior node: a regular node of the tree.  Assuming 64-bit system
- * and 64-byte cache-line size, the node up to the children pointers fit
+ * and 64-byte cache-line size, the node up to the children pointers fits
  * in 2 cache-lines and the children pointers fit in 2 cache-lines.
  */
 struct mtree_inode {
@@ -130,7 +131,7 @@ struct mtree_inode {
 
 /*
  * The border node: it is a leaf of the tree, which may either point to
- * the data or another tree layer.  Note: the leaf meta-data up to lv
+ * the data or another tree layer.  Note: the leaf meta-data up to 'lv'
  * fits in 3 cache-lines (152 bytes).
  */
 struct mtree_leaf {
@@ -154,7 +155,7 @@ struct mtree_leaf {
 /*
  * 16 four-bit fields in the 'permutation':
  * - The lower 4 bits hold the number of keys.
- * - The other bits hold an 15-element array which stores key indexes.
+ * - The other bits hold a 15-element array which stores key indexes.
  * - The permutation from keyindex[0] to keyindex[nkeys - 1].
  */
 
@@ -174,7 +175,7 @@ struct mtree_leaf {
  * Note: MTREE_NOTFOUND is just a dummy value.
  */
 #define	KEY_LLEN(l)		((l) & 0x7f)
-#define	KEY_TYPE(l)		(((l) & 0x80) ? 0x80 : ((l) & 0xc0))
+#define	KEY_TYPE(l)		((l) & 0xc0)
 
 #define	MTREE_VALUE		0x00
 #define	MTREE_LAYER		0x40
@@ -244,14 +245,12 @@ stable_version(mtree_node_t *node)
 	unsigned bcount = SPINLOCK_BACKOFF_MIN;
 	uint32_t v;
 
-	atomic_thread_fence(memory_order_acquire);
 	v = node->version;
-
 	while (__predict_false(v & (NODE_INSERTING | NODE_SPLITTING))) {
 		SPINLOCK_BACKOFF(bcount);
-		atomic_thread_fence(memory_order_acquire);
 		v = node->version;
 	}
+	atomic_thread_fence(memory_order_acquire);
 	return v;
 }
 
@@ -267,15 +266,15 @@ lock_node(mtree_node_t *node)
 	unsigned bcount = SPINLOCK_BACKOFF_MIN;
 	uint32_t v;
 again:
-	atomic_thread_fence(memory_order_acquire);
 	v = node->version;
-
 	if (v & NODE_LOCKED) {
 		SPINLOCK_BACKOFF(bcount);
 		goto again;
 	}
 	if (!atomic_compare_exchange_weak(&node->version, v, v | NODE_LOCKED))
 		goto again;
+
+	atomic_thread_fence(memory_order_acquire);
 }
 
 static void
@@ -301,8 +300,8 @@ unlock_node(mtree_node_t *node)
 	v &= ~(NODE_LOCKED | NODE_INSERTING | NODE_SPLITTING);
 
 	/* Note: store on an integer is atomic. */
-	node->version = v;
 	atomic_thread_fence(memory_order_release);
+	node->version = v;
 }
 
 static inline mtree_node_t *
@@ -503,9 +502,8 @@ leaf_insert_key(mtree_node_t *node, uint64_t key, unsigned kinfo, void *val)
 	leaf->lv[slot] = val;
 	atomic_thread_fence(memory_order_release);
 
-	/* Atomically store the new permutation.  Ensure visibility. */
+	/* Atomically store the new permutation. */
 	leaf->permutation = nperm;
-	atomic_thread_fence(memory_order_release);
 
 	return true;
 }
@@ -845,7 +843,6 @@ ascend:
 	 */
 	parent->version |= NODE_INSERTING;
 	atomic_thread_fence(memory_order_release);
-
 	internode_insert(parent, nkey, nnode);
 done:
 	ASSERT(node_get_parent(nnode) == parent);
@@ -871,9 +868,9 @@ delete_leaf_node(masstree_t *tree, mtree_node_t *node, uint64_t key)
 {
 	mtree_leaf_t *leaf = cast_to_leaf(node);
 	mtree_node_t *prev, *next, *parent;
-	uint32_t v;
 
 	ASSERT(node_locked_p(node));
+	ASSERT((node->version & (NODE_INSERTING | NODE_SPLITTING)) == 0);
 
 	/*
 	 * First, we must lock the next leaf.  Then, since the node is
@@ -881,7 +878,6 @@ delete_leaf_node(masstree_t *tree, mtree_node_t *node, uint64_t key)
 	 * the top at this point.
 	 */
 	while ((next = (mtree_node_t *)leaf->next) != NULL) {
-		v = stable_version(next);
 		lock_node(next);
 		if ((next->version & NODE_DELETED) == 0) {
 			break;
@@ -898,6 +894,7 @@ delete_leaf_node(masstree_t *tree, mtree_node_t *node, uint64_t key)
 	 */
 	while ((prev = (mtree_node_t *)leaf->prev) != NULL) {
 		mtree_leaf_t *prevl = cast_to_leaf(prev);
+		uint32_t v;
 		bool ok;
 
 		v = stable_version(prev);
@@ -912,6 +909,10 @@ delete_leaf_node(masstree_t *tree, mtree_node_t *node, uint64_t key)
 
 	/* Remove the key from the parent node. */
 	while ((parent = lock_parent_node(node)) != NULL) {
+		/* Insert our node into the G/C list. */
+		unlock_node(node);
+		gclist_add(tree, node);
+
 		/* Fail the readers by pretending the insertion. */
 		ASSERT((parent->version & NODE_DELETED) == 0);
 		parent->version |= NODE_INSERTING;
@@ -919,14 +920,10 @@ delete_leaf_node(masstree_t *tree, mtree_node_t *node, uint64_t key)
 
 		if (!internode_remove(parent, key)) {
 			/* Done (no further collapsing). */
-			unlock_node(node);
+			unlock_node(parent);
 			return true;
 		}
 		parent->version |= NODE_DELETED;
-		unlock_node(node);
-
-		/* Insert whatever we have for G/C. */
-		gclist_add(tree, node);
 		node = parent;
 	}
 
@@ -937,8 +934,8 @@ delete_leaf_node(masstree_t *tree, mtree_node_t *node, uint64_t key)
 	 * are retrying and we are a sole owner; set the root locklessly.
 	 */
 	ASSERT(node->version & NODE_ISROOT);
-	gclist_add(tree, node);
 	unlock_node(node);
+	gclist_add(tree, node);
 
 	if (tree->root == node) {
 		leaf = leaf_create(tree);
@@ -1111,14 +1108,21 @@ forward:
 	/* Fetch the value (or pointer to the next layer). */
 	idx = leaf_find_lv(leaf, skey, slen, &type);
 	lv = leaf->lv[idx];
+	atomic_thread_fence(memory_order_acquire);
 
 	/* Check that the version has not changed. */
-	atomic_thread_fence(memory_order_acquire);
 	if (__predict_false((leaf->version ^ v) > NODE_LOCKED)) {
 		leaf = walk_leaves(leaf, skey, slen, &v);
 		goto forward;
 	}
 
+	if (__predict_false(type & MTREE_UNSTABLE)) {
+		/*
+		 * The value is about to become MTREE_LAYER, unless remove
+		 * races and wins, therefore we have to re-check the key.
+		 */
+		goto forward;
+	}
 	if (__predict_true(type == MTREE_VALUE)) {
 		ASSERT((slen & MTREE_LAYER) == 0);
 		return lv;
@@ -1128,13 +1132,6 @@ forward:
 		ASSERT((slen & MTREE_LAYER) != 0);
 		root = lv;
 		goto advance;
-	}
-	if (__predict_false(type == MTREE_UNSTABLE)) {
-		/*
-		 * The value is about to become MTREE_LAYER, unless remove
-		 * races and wins, therefore we have to re-check the key.
-		 */
-		goto forward;
 	}
 	return NULL;
 }

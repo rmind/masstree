@@ -5,6 +5,10 @@
  * Use is subject to license terms, as specified in the LICENSE file.
  */
 
+#include <stdio.h>
+#include <time.h>
+#include <assert.h>
+
 #include "masstree.c"
 
 /*
@@ -143,6 +147,28 @@ random_keyval_test(void)
 	}
 }
 
+static void
+random_del_test(void)
+{
+	masstree_t *tree = masstree_create(&ops);
+	unsigned n = 100, nitems = 1000;
+	uint64_t keys[nitems];
+
+	while (--n) {
+		srandom(n);
+		for (unsigned i = 0; i < nitems; i++) {
+			keys[i] = random();
+			void *pkey = (void *)&keys[i];
+			masstree_put(tree, pkey, sizeof(uint64_t), pkey);
+		}
+		for (unsigned i = 0; i < nitems; i++) {
+			void *pkey = (void *)&keys[i];
+			bool ok = masstree_del(tree, pkey, sizeof(uint64_t));
+			assert(ok);
+		}
+	}
+}
+
 int
 main(void)
 {
@@ -151,6 +177,7 @@ main(void)
 	inode_ops_test();
 
 	random_keyval_test();
+	//random_del_test();
 
 	puts("ok");
 	return 0;
