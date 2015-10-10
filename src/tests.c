@@ -168,7 +168,7 @@ main(void)
 	inode_ops_test();
 
 	random_keyval_test();
-	//random_del_test();
+	random_del_test();
 
 	puts("ok");
 	return 0;

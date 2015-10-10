@@ -124,14 +124,17 @@ main(int argc, char **argv)
 		line[len - 1] = '\0';
 		key = p[1];
 
-		if (strcmp(p[0], "SET") == 0) {
+		if (strcmp(p[0], "SET") == 0 && c > 2) {
 			unsigned long val = atol(p[2]);
 			valp = (void *)(uintptr_t)val;
 			masstree_put(tree, key, strlen(key), valp);
 		}
-		if (strcmp(p[0], "GET") == 0 && c > 1) {
+		if (strcmp(p[0], "GET") == 0) {
 			valp = masstree_get(tree, key, strlen(key));
 			printf("%lu\n", (unsigned)(uintptr_t)valp);
+		}
+		if (strcmp(p[0], "DEL") == 0) {
+			masstree_del(tree, key, strlen(key));
 		}
 	}
 

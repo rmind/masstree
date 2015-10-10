@@ -552,7 +552,7 @@ leaf_remove_key(mtree_node_t *node, uint64_t key, unsigned len)
 	} else {
 		nperm = perm - 1;
 	}
-	leaf->removed |= 1 << idx;
+	leaf->removed |= 1U << idx;
 	leaf->permutation = nperm;
 	atomic_thread_fence(memory_order_release);
 
@@ -620,7 +620,7 @@ internode_insert(mtree_node_t *node, uint64_t key, mtree_node_t *child)
 	node_set_parent(child, inode);
 }
 
-static bool
+static mtree_node_t *
 internode_remove(mtree_node_t *node, uint64_t key)
 {
 	mtree_inode_t *inode = cast_to_inode(node);
@@ -629,11 +629,19 @@ internode_remove(mtree_node_t *node, uint64_t key)
 	ASSERT(nkeys > 0);
 	ASSERT(node_locked_p(node));
 	ASSERT(node->version & NODE_INSERTING);
-	ASSERT(key >= inode->keyslice[0]);
+
+	/*
+	 * Removing the last key - determine the stray leaf and
+	 * return its pointer for the rotation.
+	 */
+	if (inode->nkeys == 1) {
+		i = !(key < inode->keyslice[0]);
+		return inode->child[i];
+	}
 
 	/* Find the position and move the right-hand side. */
 	for (i = 0; i < nkeys; i++)
-		if (key == inode->keyslice[i])
+		if (key <= inode->keyslice[i])
 			break;
 	klen = (nkeys - i) * sizeof(uint64_t);
 	if (klen) {
@@ -641,7 +649,8 @@ internode_remove(mtree_node_t *node, uint64_t key)
 		memmove(&inode->keyslice[i], &inode->keyslice[i + 1], klen);
 		memmove(&inode->child[i + 1], &inode->child[i + 2], clen);
 	}
-	return --inode->nkeys == 0;
+	inode->nkeys--;
+	return NULL;
 }
 
 /*
@@ -866,6 +875,51 @@ done:
 	return keynode;
 }
 
+static bool
+collapse_inodes(masstree_t *tree, mtree_node_t *node, uint64_t key)
+{
+	mtree_node_t *parent, *child;
+
+	ASSERT(node->version & NODE_DELETED);
+
+	/*
+	 * Lock the parent.  If there is no parent, then we hit the
+	 * root of a layer.  If this is the first level, then create a
+	 * fresh leaf and set the new root.  Note that the old root node
+	 * is marked as "deleted" - all traversal attempts are retrying
+	 * and we are a sole owner; set the root locklessly.
+	 */
+	if ((parent = lock_parent_node(node)) == NULL) {
+		ASSERT(node->version & NODE_ISROOT);
+		unlock_node(node);
+
+		if (tree->root == node) {
+			mtree_leaf_t *leaf = leaf_create(tree);
+			leaf->version |= NODE_ISROOT;
+			atomic_thread_fence(memory_order_release);
+			tree->root = (mtree_node_t *)leaf;
+			return true;
+		}
+		return false;
+	}
+	unlock_node(node);
+
+	/* Fail the readers by pretending the insertion. */
+	ASSERT((parent->version & NODE_DELETED) == 0);
+	parent->version |= NODE_INSERTING;
+	atomic_thread_fence(memory_order_release);
+
+	/* Remove the key from the parent node. */
+	if ((child = internode_remove(parent, key)) == NULL) {
+		/* Done (no further collapsing). */
+		unlock_node(parent);
+		return true;
+	}
+	parent->version |= NODE_DELETED;
+	node = parent;
+	return false;
+}
+
 /*
  * delete_leaf_mode: remove the leaf and add for G/C, if necessary
  * indicating the caller that the whole layer should be collapsed.
@@ -874,12 +928,14 @@ static inline bool
 delete_leaf_node(masstree_t *tree, mtree_node_t *node, uint64_t key)
 {
 	mtree_leaf_t *leaf = cast_to_leaf(node);
-	mtree_node_t *prev, *next, *parent;
+	mtree_node_t *prev, *next;
 
 	ASSERT(node_locked_p(node));
 	ASSERT((node->version & (NODE_INSERTING | NODE_SPLITTING)) == 0);
 
 	/*
+	 * Unlink the leaf from the doubly-linked list.
+	 *
 	 * First, we must lock the next leaf.  Then, since the node is
 	 * empty, mark as deleted.  Any readers will fail and retry from
 	 * the top at this point.
@@ -914,46 +970,14 @@ delete_leaf_node(masstree_t *tree, mtree_node_t *node, uint64_t key)
 		unlock_node(next);
 	}
 
-	/* Remove the key from the parent node. */
-	while ((parent = lock_parent_node(node)) != NULL) {
-		/* Insert our node into the G/C list. */
-		unlock_node(node);
-		gclist_add(tree, node);
-
-		/* Fail the readers by pretending the insertion. */
-		ASSERT((parent->version & NODE_DELETED) == 0);
-		parent->version |= NODE_INSERTING;
-		atomic_thread_fence(memory_order_release);
-
-		if (!internode_remove(parent, key)) {
-			/* Done (no further collapsing). */
-			unlock_node(parent);
-			return true;
-		}
-		parent->version |= NODE_DELETED;
-		node = parent;
-	}
-
-	/*
-	 * We have hit the root of a layer.  If this is the first level,
-	 * then create a fresh leaf and set the new root.  Note that the
-	 * old root node is marked as "deleted" - all traversal attempts
-	 * are retrying and we are a sole owner; set the root locklessly.
-	 */
-	ASSERT(node->version & NODE_ISROOT);
-	unlock_node(node);
+	/* Insert our node into the G/C list. */
 	gclist_add(tree, node);
 
-	if (tree->root == node) {
-		leaf = leaf_create(tree);
-		leaf->version |= NODE_ISROOT;
-		atomic_thread_fence(memory_order_release);
-		tree->root = (mtree_node_t *)leaf;
-		return true;
-	}
-
-	/* Tell the caller to collapse the whole layer. */
-	return false;
+	/*
+	 * Collapse the intermediate nodes (note: releases the leaf lock).
+	 * This might tell the caller to collapse the whole layer.
+	 */
+	return collapse_inodes(tree, node, key);
 }
 
 /*

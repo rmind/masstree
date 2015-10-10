@@ -12,9 +12,13 @@ endif
 ifeq ($(MAKECMDGOALS),test)
 DEBUG=		1
 endif
+ifeq ($(MAKECMDGOALS),vis)
+DEBUG=		1
+endif
 
 ifdef DEBUG
 CFLAGS+=	-O0 -DDEBUG -fno-omit-frame-pointer
+CFLAGS+=	-fprofile-arcs -ftest-coverage
 else
 CFLAGS+=	-DNDEBUG
 LDFLAGS=	-flto
@@ -48,15 +52,17 @@ install: $(addprefix install/,$(LIB).la)
 	#mkdir -p $(IMANDIR) && install -c $(MANS) $(IMANDIR)
 
 test: tests.o
-	$(CC) -O0 -g -W -Wall $< -o masstree_test
-	./masstree_test
+	$(CC) $(CFLAGS) $(LDFLAGS) $< -o masstree_test
+	#./masstree_test
+	#gcov -c -b ./tests.c
 
 vis: vis.o
-	$(CC) -O0 -g -W -Wall $< -o masstree_vis
+	$(CC) $(CFLAGS) $(LDFLAGS) $< -o masstree_vis
 	./vis.sh
 
 clean:
 	libtool --mode=clean rm
-	rm -rf .libs *.o *.lo *.la masstree_test masstree_vis
+	rm -rf .libs *.o *.lo *.la *.gcno *.gcov
+	rm -f masstree_test masstree_vis
 
 .PHONY: all lib install test vis clean
