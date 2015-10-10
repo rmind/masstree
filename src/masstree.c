@@ -212,6 +212,13 @@ fetch_word64(const void *key, const size_t len, unsigned *l, unsigned *slen)
 	return htobe64(skey);
 }
 
+static void
+__masstree_free_wrapper(void *ptr, size_t size)
+{
+	(void)size;
+	free(ptr);
+}
+
 /*
  * Type casts with diagnostic checks.
  */
@@ -1116,13 +1123,6 @@ forward:
 		goto forward;
 	}
 
-	if (__predict_false(type & MTREE_UNSTABLE)) {
-		/*
-		 * The value is about to become MTREE_LAYER, unless remove
-		 * races and wins, therefore we have to re-check the key.
-		 */
-		goto forward;
-	}
 	if (__predict_true(type == MTREE_VALUE)) {
 		ASSERT((slen & MTREE_LAYER) == 0);
 		return lv;
@@ -1132,6 +1132,13 @@ forward:
 		ASSERT((slen & MTREE_LAYER) != 0);
 		root = lv;
 		goto advance;
+	}
+	if (__predict_false((type & ~MTREE_LAYER) == MTREE_UNSTABLE)) {
+		/*
+		 * The value is about to become MTREE_LAYER, unless remove
+		 * races and wins, therefore we have to re-check the key.
+		 */
+		goto forward;
 	}
 	return NULL;
 }
@@ -1309,6 +1316,12 @@ masstree_create(const masstree_ops_t *ops)
 	masstree_t *tree;
 	mtree_node_t *root;
 
+	if (ops == NULL) {
+		static const masstree_ops_t default_ops = {
+			.alloc = malloc, .free = __masstree_free_wrapper
+		};
+		ops = &default_ops;
+	}
 	if ((tree = ops->alloc(sizeof(masstree_t))) == NULL) {
 		return NULL;
 	}

@@ -24,15 +24,6 @@ string_to_key(const char *s, size_t *len)
 	return htobe64(key);
 }
 
-static void
-free2(void *ptr, size_t len)
-{
-	(void)len;
-	free(ptr);
-}
-
-static const masstree_ops_t	ops = { .alloc = malloc, .free = free2 };
-
 /*
  * Unit tests.
  */
@@ -74,7 +65,7 @@ node_locking_test(void)
 static void
 leaf_ops_test(void)
 {
-	masstree_t *tree = masstree_create(&ops);
+	masstree_t *tree = masstree_create(NULL);
 	mtree_leaf_t *leaf = leaf_create(tree);
 	mtree_node_t *node = (mtree_node_t *)leaf;
 	size_t len;
@@ -102,7 +93,7 @@ leaf_ops_test(void)
 static void
 inode_ops_test(void)
 {
-	masstree_t *tree = masstree_create(&ops);
+	masstree_t *tree = masstree_create(NULL);
 	mtree_inode_t *inode = internode_create(tree);
 	mtree_node_t *node = (mtree_node_t *)inode;
 	uint64_t keys[] = { 1, 2, 3 };
@@ -128,7 +119,7 @@ static void
 random_keyval_test(void)
 {
 	for (unsigned s = 1; s <= 100; s++) {
-		masstree_t *tree = masstree_create(&ops);
+		masstree_t *tree = masstree_create(NULL);
 		size_t n = 10000, i = n;
 
 		srandom(s);
@@ -150,7 +141,7 @@ random_keyval_test(void)
 static void
 random_del_test(void)
 {
-	masstree_t *tree = masstree_create(&ops);
+	masstree_t *tree = masstree_create(NULL);
 	unsigned n = 100, nitems = 1000;
 	uint64_t keys[nitems];
 

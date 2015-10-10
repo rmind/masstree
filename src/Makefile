@@ -51,8 +51,12 @@ test: tests.o
 	$(CC) -O0 -g -W -Wall $< -o masstree_test
 	./masstree_test
 
+vis: vis.o
+	$(CC) -O0 -g -W -Wall $< -o masstree_vis
+	./vis.sh
+
 clean:
 	libtool --mode=clean rm
-	rm -rf .libs *.o *.lo *.la masstree_test
+	rm -rf .libs *.o *.lo *.la masstree_test masstree_vis
 
-.PHONY: all lib install test clean
+.PHONY: all lib install test vis clean
