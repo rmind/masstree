@@ -635,7 +635,7 @@ internode_remove(mtree_node_t *node, uint64_t key)
 	 * return its pointer for the rotation.
 	 */
 	if (inode->nkeys == 1) {
-		i = !(key < inode->keyslice[0]);
+		i = (key < inode->keyslice[0]);
 		return inode->child[i];
 	}
 
@@ -875,10 +875,17 @@ done:
 	return keynode;
 }
 
+/*
+ * collapse_inodes: collapse intermediate nodes and indicate whether
+ * the whole layer should be collapsed (true) or not (false).
+ */
 static bool
-collapse_inodes(masstree_t *tree, mtree_node_t *node, uint64_t key)
+collapse_inodes(masstree_t *tree, mtree_node_t *node, uint64_t key,
+    mtree_node_t **nroot)
 {
-	mtree_node_t *parent, *child;
+	mtree_node_t *parent, *child = NULL;
+	mtree_inode_t *pnode;
+	unsigned i;
 
 	ASSERT(node->version & NODE_DELETED);
 
@@ -890,19 +897,10 @@ collapse_inodes(masstree_t *tree, mtree_node_t *node, uint64_t key)
 	 * and we are a sole owner; set the root locklessly.
 	 */
 	if ((parent = lock_parent_node(node)) == NULL) {
-		ASSERT(node->version & NODE_ISROOT);
-		unlock_node(node);
-
-		if (tree->root == node) {
-			mtree_leaf_t *leaf = leaf_create(tree);
-			leaf->version |= NODE_ISROOT;
-			atomic_thread_fence(memory_order_release);
-			tree->root = (mtree_node_t *)leaf;
-			return true;
-		}
-		return false;
+		goto reroot;
 	}
 	unlock_node(node);
+	gclist_add(tree, node);
 
 	/* Fail the readers by pretending the insertion. */
 	ASSERT((parent->version & NODE_DELETED) == 0);
@@ -913,19 +911,59 @@ collapse_inodes(masstree_t *tree, mtree_node_t *node, uint64_t key)
 	if ((child = internode_remove(parent, key)) == NULL) {
 		/* Done (no further collapsing). */
 		unlock_node(parent);
-		return true;
+		return false;
 	}
+
+	/*
+	 * It was the last key, therefore rotate the tree: delete the
+	 * internode and assign its child to the new parent.
+	 */
 	parent->version |= NODE_DELETED;
 	node = parent;
+	if ((parent = lock_parent_node(node)) == NULL) {
+		goto reroot;
+	}
+	pnode = cast_to_inode(parent);
+	unlock_node(node);
+	gclist_add(tree, node);
+
+	/* Assign the child, set its parent pointer. */
+	for (i = 0; i < pnode->nkeys; i++)
+		if (key < pnode->keyslice[i])
+			break;
+	pnode->child[i] = child;
+	node_set_parent(child, pnode);
+	unlock_node(parent);
 	return false;
+reroot:
+	ASSERT(node->version & NODE_ISROOT);
+	unlock_node(node);
+	gclist_add(tree, node);
+
+	if (tree->root == node) {
+		if (!child) {
+			mtree_leaf_t *leaf = leaf_create(tree);
+			leaf->version |= NODE_ISROOT;
+			atomic_thread_fence(memory_order_release);
+			tree->root = (mtree_node_t *)leaf;
+		} else {
+			tree->root = (mtree_node_t *)child;
+		}
+		return false;
+	}
+	*nroot = child;
+
+	/* Collapse the layer. */
+	return true;
 }
 
 /*
- * delete_leaf_mode: remove the leaf and add for G/C, if necessary
+ * delete_leaf_node: remove the leaf and add for G/C, if necessary
  * indicating the caller that the whole layer should be collapsed.
  */
 static inline bool
-delete_leaf_node(masstree_t *tree, mtree_node_t *node, uint64_t key)
+delete_leaf_node(masstree_t *tree, mtree_node_t *node, uint64_t key,
+    mtree_node_t **nroot)
 {
 	mtree_leaf_t *leaf = cast_to_leaf(node);
 	mtree_node_t *prev, *next;
@@ -970,14 +1008,11 @@ delete_leaf_node(masstree_t *tree, mtree_node_t *node, uint64_t key)
 		unlock_node(next);
 	}
 
-	/* Insert our node into the G/C list. */
-	gclist_add(tree, node);
-
 	/*
 	 * Collapse the intermediate nodes (note: releases the leaf lock).
 	 * This might tell the caller to collapse the whole layer.
 	 */
-	return collapse_inodes(tree, node, key);
+	return collapse_inodes(tree, node, key, nroot);
 }
 
 /*
@@ -1248,7 +1283,7 @@ retry:
 bool
 masstree_del(masstree_t *tree, const void *key, size_t len)
 {
-	mtree_node_t *root = tree->root, *node;
+	mtree_node_t *root = tree->root, *node, *nroot;
 	unsigned l = 0, collapse = 0, slen, idx, type;
 	mtree_leaf_t *leaf;
 	uint64_t skey;
@@ -1268,6 +1303,14 @@ retry:
 	/* If we have collapsed a layer, then delete its key. */
 	if (l == collapse) {
 		ASSERT(collapse != 0);
+
+		if (nroot) {
+			ASSERT(type == MTREE_LAYER);
+			leaf->lv[idx] = nroot;
+			unlock_node(node);
+			return true;
+		}
+
 		slen = (slen & ~MTREE_VALUE) | MTREE_LAYER;
 		type = MTREE_VALUE;
 	}
@@ -1282,7 +1325,7 @@ retry:
 		}
 
 		/* It was the last key: deleting the whole leaf. */
-		if (delete_leaf_node(tree, node, skey)) {
+		if (!delete_leaf_node(tree, node, skey, &nroot)) {
 			return true;
 		}
 
