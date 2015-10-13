@@ -58,11 +58,23 @@
  *   readers until the modification is complete.
  *
  * - SPLITS: Performed by locking the node, its sibling and its parent,
- *   as well as setting the NODE_SPLITTING bit to indicate the "dirty"
- *   state of the node while operation is in progress.
+ *   as well as setting the NODE_SPLITTING bit to indicate that the node
+ *   is "dirty" and that the tree shape is changing: this ensures that
+ *   the readers either a) retry from the root b) use walk_leaves() to
+ *   find check the split leaves on the right side.
  *
- * - LOCKING AND LOCK ORDER: Nodes are locked bottom-up; they may also be
- *   locked left-to-right as long as the parent is locked last (think of
+ * - LAYERING: The tree within a layer may: a) get a new root (due to
+ *   to split or collapse)  b) be entirely collapsed and thus removed.
+ *   In both cases, the leaf of the upper layer is updated by walking
+ *   the tree again from the top layer.  The stale root pointer is not
+ *   a problem due root walk-up which will be caused either by the split
+ *   flag or NODE_ISROOT absence.  The layer deletion, however, results
+ *   in the NODE_DELETED flag set on the lower layer root, thus failing
+ *   all readers as well as writers operating on the layer.  This has
+ *   an effect of "locking" its upper key slice.
+ *
+ * - LOCKING AND LOCK ORDER: Nodes are locked bottom-up, but top-down
+ *   across the layers.  They may also be locked left-to-right (think of
  *   counter clock-wise).  Pointers to the parent and previous nodes are
  *   protected by the lock of the nodes they are pointing to.
  */
@@ -321,6 +333,17 @@ node_get_parent(mtree_node_t *node)
 		mtree_inode_t *inode = cast_to_inode(node);
 		return (mtree_node_t *)inode->parent;
 	}
+}
+
+static inline mtree_node_t *
+walk_to_root(mtree_node_t *node)
+{
+	mtree_node_t *parent;
+
+	while ((parent = node_get_parent(node)) != NULL) {
+		parent = node;
+	}
+	return node;
 }
 
 static inline void
@@ -822,7 +845,11 @@ ascend:
 		node_set_parent(node, pnode);
 		node_set_parent(nnode, pnode);
 		parent = (mtree_node_t *)pnode;
-		tree->root = parent;
+
+		// XXX ok to be lockless?
+		if (tree->root == node) {
+			tree->root = parent;
+		}
 
 		/* Release the locks. */
 		goto done;
@@ -875,13 +902,21 @@ done:
 	return keynode;
 }
 
+static inline void
+cleanup_layer(mtree_leaf_t *leaf, unsigned idx)
+{
+	mtree_node_t *layer = leaf->lv[idx];
+
+	ASSERT(node_locked_p((mtree_node_t *)leaf));
+
+}
+
 /*
- * collapse_inodes: collapse intermediate nodes and indicate whether
+ * collapse_nodes: collapse the intermediate nodes and indicate whether
  * the whole layer should be collapsed (true) or not (false).
  */
 static bool
-collapse_inodes(masstree_t *tree, mtree_node_t *node, uint64_t key,
-    mtree_node_t **nroot)
+collapse_nodes(masstree_t *tree, mtree_node_t *node, uint64_t key)
 {
 	mtree_node_t *parent, *child = NULL;
 	mtree_inode_t *pnode;
@@ -890,11 +925,8 @@ collapse_inodes(masstree_t *tree, mtree_node_t *node, uint64_t key,
 	ASSERT(node->version & NODE_DELETED);
 
 	/*
-	 * Lock the parent.  If there is no parent, then we hit the
-	 * root of a layer.  If this is the first level, then create a
-	 * fresh leaf and set the new root.  Note that the old root node
-	 * is marked as "deleted" - all traversal attempts are retrying
-	 * and we are a sole owner; set the root locklessly.
+	 * Lock the parent.  If there is no parent, then the leaf is
+	 * the root of a layer.
 	 */
 	if ((parent = lock_parent_node(node)) == NULL) {
 		goto reroot;
@@ -940,6 +972,12 @@ reroot:
 	unlock_node(node);
 	gclist_add(tree, node);
 
+	/*
+	 * If this is the first level, then create a fresh leaf and
+	 * set the new root.  Note that the our leaf (the old root) is
+	 * marked as "deleted" - all traversal attempts are retrying
+	 * and we are a sole owner; set the root locklessly.
+	 */
 	if (tree->root == node) {
 		if (!child) {
 			mtree_leaf_t *leaf = leaf_create(tree);
@@ -951,19 +989,19 @@ reroot:
 		}
 		return false;
 	}
-	*nroot = child;
 
-	/* Collapse the layer. */
+	/* Indicate that the upper layer needs a clean up. */
 	return true;
 }
 
 /*
- * delete_leaf_node: remove the leaf and add for G/C, if necessary
- * indicating the caller that the whole layer should be collapsed.
+ * delete_leaf_node: remove the leaf and add it for G/C, if necessary
+ * triggering the layer collapse.
+ *
+ * => Return true if the upper layer needs a cleanup.
  */
 static inline bool
-delete_leaf_node(masstree_t *tree, mtree_node_t *node, uint64_t key,
-    mtree_node_t **nroot)
+delete_leaf_node(masstree_t *tree, mtree_node_t *node, uint64_t key)
 {
 	mtree_leaf_t *leaf = cast_to_leaf(node);
 	mtree_node_t *prev, *next;
@@ -1010,9 +1048,9 @@ delete_leaf_node(masstree_t *tree, mtree_node_t *node, uint64_t key,
 
 	/*
 	 * Collapse the intermediate nodes (note: releases the leaf lock).
-	 * This might tell the caller to collapse the whole layer.
+	 * This might tell the caller to clean up the upper layer.
 	 */
-	return collapse_inodes(tree, node, key, nroot);
+	return collapse_nodes(tree, node, key);
 }
 
 /*
@@ -1024,15 +1062,15 @@ delete_leaf_node(masstree_t *tree, mtree_node_t *node, uint64_t key,
 static mtree_leaf_t *
 find_leaf(mtree_node_t *root, uint64_t key, uint32_t *rv)
 {
-	mtree_node_t *node = root;
+	mtree_node_t *node;
 	uint32_t v;
 retry:
+	node = root;
 	v = stable_version(node);
 
 	/* Handle stale roots which can occur due to splits. */
 	if (__predict_false((v & NODE_ISROOT) == 0)) {
-		node = node_get_parent(node);
-		ASSERT(node != NULL);
+		root = walk_to_root(node);
 		goto retry;
 	}
 
@@ -1283,7 +1321,7 @@ retry:
 bool
 masstree_del(masstree_t *tree, const void *key, size_t len)
 {
-	mtree_node_t *root = tree->root, *node, *nroot;
+	mtree_node_t *root = tree->root, *node;
 	unsigned l = 0, collapse = 0, slen, idx, type;
 	mtree_leaf_t *leaf;
 	uint64_t skey;
@@ -1300,17 +1338,33 @@ retry:
 	idx = leaf_find_lv(leaf, skey, slen, &type);
 	node = (mtree_node_t *)leaf;
 
-	/* If we have collapsed a layer, then delete its key. */
+	/*
+	 * If we have collapsed a layer, clean up the layer: either
+	 * find and set the a new root or delete its key.
+	 */
 	if (l == collapse) {
+		mtree_node_t *layer;
+
 		ASSERT(collapse != 0);
 
-		if (nroot) {
-			ASSERT(type == MTREE_LAYER);
-			leaf->lv[idx] = nroot;
+		/*
+		 * Check if it points to the root; otherwise, walk up to
+		 * the root and reset our pointer.
+		 */
+		layer = leaf->lv[idx];
+		if ((layer->version & NODE_ISROOT) == 0) {
+			layer = walk_to_root(node);
+			leaf->lv[idx] = layer;
 			unlock_node(node);
 			return true;
 		}
+		if ((layer->version & NODE_DELETED) == 0) {
+			unlock_node(node);
+			return true;
+		}
+		ASSERT(layer->version & NODE_ISROOT);
 
+		/* Delete the layer key. */
 		slen = (slen & ~MTREE_VALUE) | MTREE_LAYER;
 		type = MTREE_VALUE;
 	}
@@ -1325,14 +1379,13 @@ retry:
 		}
 
 		/* It was the last key: deleting the whole leaf. */
-		if (!delete_leaf_node(tree, node, skey, &nroot)) {
+		if (!delete_leaf_node(tree, node, skey)) {
 			return true;
 		}
 
 		/*
-		 * Deleted the whole layer - indicate the layer we have
-		 * collapsed and remove the layer key.  We have to reset
-		 * to root and start from the first layer.
+		 * Indicate some layer collapse: we have to clean it up.
+		 * Reset root and start from the first layer.
 		 */
 		collapse = l - 1;
 		root = tree->root, l = 0;
