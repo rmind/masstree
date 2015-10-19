@@ -647,7 +647,7 @@ static mtree_node_t *
 internode_remove(mtree_node_t *node, uint64_t key)
 {
 	mtree_inode_t *inode = cast_to_inode(node);
-	unsigned i, klen, nkeys = inode->nkeys;
+	unsigned i, nkeys = inode->nkeys;
 
 	ASSERT(nkeys > 0);
 	ASSERT(node_locked_p(node));
@@ -664,13 +664,13 @@ internode_remove(mtree_node_t *node, uint64_t key)
 
 	/* Find the position and move the right-hand side. */
 	for (i = 0; i < nkeys; i++)
-		if (key <= inode->keyslice[i])
+		if (key < inode->keyslice[i])
 			break;
-	klen = (nkeys - i) * sizeof(uint64_t);
-	if (klen) {
-		unsigned clen = (nkeys - i + 1) * sizeof(mtree_node_t *);
+	if (i != nkeys) {
+		const unsigned klen = (nkeys - i - 1) * sizeof(uint64_t);
+		const unsigned clen = (nkeys - i) * sizeof(mtree_node_t *);
 		memmove(&inode->keyslice[i], &inode->keyslice[i + 1], klen);
-		memmove(&inode->child[i + 1], &inode->child[i + 2], clen);
+		memmove(&inode->child[i], &inode->child[i + 1], clen);
 	}
 	inode->nkeys--;
 	return NULL;
@@ -902,15 +902,6 @@ done:
 	return keynode;
 }
 
-static inline void
-cleanup_layer(mtree_leaf_t *leaf, unsigned idx)
-{
-	mtree_node_t *layer = leaf->lv[idx];
-
-	ASSERT(node_locked_p((mtree_node_t *)leaf));
-
-}
-
 /*
  * collapse_nodes: collapse the intermediate nodes and indicate whether
  * the whole layer should be collapsed (true) or not (false).
@@ -945,6 +936,7 @@ collapse_nodes(masstree_t *tree, mtree_node_t *node, uint64_t key)
 		unlock_node(parent);
 		return false;
 	}
+	ASSERT(child != node);
 
 	/*
 	 * It was the last key, therefore rotate the tree: delete the
@@ -953,6 +945,11 @@ collapse_nodes(masstree_t *tree, mtree_node_t *node, uint64_t key)
 	parent->version |= NODE_DELETED;
 	node = parent;
 	if ((parent = lock_parent_node(node)) == NULL) {
+		/* XXX locking */
+		lock_node(child);
+		child->version |= NODE_ISROOT;
+		node_set_parent(child, NULL);
+		unlock_node(child);
 		goto reroot;
 	}
 	pnode = cast_to_inode(parent);
@@ -1322,7 +1319,7 @@ bool
 masstree_del(masstree_t *tree, const void *key, size_t len)
 {
 	mtree_node_t *root = tree->root, *node;
-	unsigned l = 0, collapse = 0, slen, idx, type;
+	unsigned l = 0, cleanup = 0, slen, idx, type;
 	mtree_leaf_t *leaf;
 	uint64_t skey;
 advance:
@@ -1339,13 +1336,13 @@ retry:
 	node = (mtree_node_t *)leaf;
 
 	/*
-	 * If we have collapsed a layer, clean up the layer: either
-	 * find and set the a new root or delete its key.
+	 * If we have to cleanup the layer: either find and set the a
+	 * new root or delete its key.
 	 */
-	if (l == collapse) {
+	if (l == cleanup) {
 		mtree_node_t *layer;
 
-		ASSERT(collapse != 0);
+		ASSERT(cleanup != 0);
 
 		/*
 		 * Check if it points to the root; otherwise, walk up to
@@ -1370,7 +1367,7 @@ retry:
 	}
 
 	if (type == MTREE_VALUE) {
-		ASSERT((slen & MTREE_LAYER) == 0 || collapse);
+		ASSERT((slen & MTREE_LAYER) == 0 || cleanup);
 
 		/* The key was found: delete it. */
 		if (!leaf_remove_key(node, skey, slen)) {
@@ -1384,10 +1381,10 @@ retry:
 		}
 
 		/*
-		 * Indicate some layer collapse: we have to clean it up.
-		 * Reset root and start from the first layer.
+		 * Indicate some layer clean up.  Reset root and start
+		 * from the first layer.
 		 */
-		collapse = l - 1;
+		cleanup = l - 1;
 		root = tree->root, l = 0;
 		goto advance;
 	}
