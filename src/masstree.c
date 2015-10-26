@@ -201,6 +201,10 @@ struct masstree {
 	const masstree_ops_t *	ops;
 };
 
+/*
+ * A few low-level helper routines and type casting wrappers.
+ */
+
 static inline uint64_t
 fetch_word64(const void *key, const size_t len, unsigned *l, unsigned *slen)
 {
@@ -231,10 +235,6 @@ __masstree_free_wrapper(void *ptr, size_t size)
 	free(ptr);
 }
 
-/*
- * Type casts with diagnostic checks.
- */
-
 static inline mtree_leaf_t *
 cast_to_leaf(mtree_node_t *node)
 {
@@ -247,6 +247,43 @@ cast_to_inode(mtree_node_t *node)
 {
 	ASSERT((node->version & NODE_ISBORDER) == 0);
 	return (mtree_inode_t *)node;
+}
+
+/*
+ * Diagnostic checks to ease the debugging; they are valid only for
+ * the single-threaded testing.
+ */
+
+static inline bool
+validate_leaf(const mtree_leaf_t *leaf)
+{
+	NOSMP_ASSERT(!leaf->prev || leaf->prev->next == leaf);
+	NOSMP_ASSERT(!leaf->next || leaf->next->prev == leaf);
+	return true;
+}
+
+static inline bool
+validate_inode(const mtree_inode_t *inode)
+{
+	unsigned nkeys = inode->nkeys;
+
+	for (unsigned i = 1; i < nkeys; i++) {
+		NOSMP_ASSERT(inode->keyslice[i - 1] < inode->keyslice[i]);
+	}
+	for (unsigned i = 0; i < nkeys + 1; i++) {
+		uint32_t v = inode->child[i]->version;
+
+		if (v & NODE_DELETED)
+			continue;
+		if (v & NODE_ISBORDER) {
+			mtree_leaf_t *leaf = cast_to_leaf(inode->child[i]);
+			NOSMP_ASSERT(validate_leaf(leaf));
+		} else {
+			mtree_inode_t *c = cast_to_inode(inode->child[i]);
+			NOSMP_ASSERT(validate_inode(c));
+		}
+	}
+	return true;
 }
 
 /*
@@ -305,6 +342,7 @@ unlock_node(mtree_node_t *node)
 
 	/*
 	 * Increment the counter (either for insert or split).
+	 * Clear NODE_ISROOT if split occured, it has a parent now.
 	 */
 	if (v & NODE_INSERTING) {
 		uint32_t c = (v & NODE_VINSERT) + (1 << NODE_VINSERT_SHIFT);
@@ -312,7 +350,7 @@ unlock_node(mtree_node_t *node)
 	}
 	if (v & NODE_SPLITTING) {
 		uint32_t c = (v & NODE_VSPLIT) + (1 << NODE_VSPLIT_SHIFT);
-		v = (v & ~NODE_VSPLIT) | c;
+		v = ((v & ~NODE_ISROOT) & ~NODE_VSPLIT) | c;
 	}
 
 	/* Release the lock and clear the operation flags. */
@@ -432,6 +470,8 @@ leaf_find_lv(const mtree_leaf_t *leaf, uint64_t key,
 {
 	const uint64_t perm = leaf->permutation;
 	unsigned i, nkeys = PERM_NKEYS(perm);
+
+	NOSMP_ASSERT(validate_leaf(leaf));
 
 	for (i = 0; i < nkeys; i++) {
 		const unsigned idx = PERM_KEYIDX(perm, i);
@@ -606,6 +646,8 @@ internode_lookup(mtree_node_t *node, uint64_t key)
 	mtree_inode_t *inode = cast_to_inode(node);
 	unsigned i, nkeys = inode->nkeys;
 
+	NOSMP_ASSERT(validate_inode(inode));
+
 	for (i = 0; i < nkeys; i++)
 		if (key < inode->keyslice[i])
 			break;
@@ -618,22 +660,23 @@ static void
 internode_insert(mtree_node_t *node, uint64_t key, mtree_node_t *child)
 {
 	mtree_inode_t *inode = cast_to_inode(node);
-	unsigned i, klen, nkeys = inode->nkeys;
+	unsigned i, nkeys = inode->nkeys;
 
 	ASSERT(nkeys < NODE_MAX);
 	ASSERT(node_locked_p(node));
 	ASSERT(node_locked_p(child));
 	ASSERT(node->version & (NODE_INSERTING | NODE_SPLITTING));
+	NOSMP_ASSERT(validate_inode(inode));
 
 	/* Find the position and move the right-hand side. */
 	for (i = 0; i < nkeys; i++)
 		if (key < inode->keyslice[i])
 			break;
-	klen = (nkeys - i) * sizeof(uint64_t);
-	if (klen) {
-		unsigned clen = (nkeys - i) * sizeof(mtree_node_t *);
+	if (i != nkeys) {
+		const unsigned klen = (nkeys - i) * sizeof(uint64_t);
+		const unsigned clen = (nkeys - i + 1) * sizeof(mtree_node_t *);
 		memmove(&inode->keyslice[i + 1], &inode->keyslice[i], klen);
-		memmove(&inode->child[i + 2], &inode->child[i + 1], clen);
+		memmove(&inode->child[i + 1], &inode->child[i], clen);
 	}
 
 	/* Insert the new key and the child. */
@@ -641,6 +684,7 @@ internode_insert(mtree_node_t *node, uint64_t key, mtree_node_t *child)
 	inode->child[i + 1] = child;
 	inode->nkeys++;
 	node_set_parent(child, inode);
+	NOSMP_ASSERT(validate_inode(inode));
 }
 
 static mtree_node_t *
@@ -652,6 +696,7 @@ internode_remove(mtree_node_t *node, uint64_t key)
 	ASSERT(nkeys > 0);
 	ASSERT(node_locked_p(node));
 	ASSERT(node->version & NODE_INSERTING);
+	NOSMP_ASSERT(validate_inode(inode));
 
 	/*
 	 * Removing the last key - determine the stray leaf and
@@ -673,6 +718,8 @@ internode_remove(mtree_node_t *node, uint64_t key)
 		memmove(&inode->child[i], &inode->child[i + 1], clen);
 	}
 	inode->nkeys--;
+
+	NOSMP_ASSERT(validate_inode(inode));
 	return NULL;
 }
 
@@ -724,6 +771,8 @@ split_inter_node(masstree_t *tree, mtree_node_t *parent, uint64_t ckey,
 	mtree_node_t *pnode = (mtree_node_t *)(toleft ? lnode : rnode);
 	internode_insert(pnode, ckey, nchild);
 
+	NOSMP_ASSERT(validate_inode(lnode));
+	NOSMP_ASSERT(validate_inode(rnode));
 	return (mtree_node_t *)rnode;
 }
 
@@ -790,7 +839,10 @@ split_leaf_node(masstree_t *tree, mtree_node_t *node,
 	 */
 	nleaf->version |= NODE_SPLITTING;
 	nleaf->permutation = PERM_SEQUENTIAL | (NODE_MAX - NODE_PIVOT);
-	nleaf->next = leaf->next;
+	if ((nleaf->next = leaf->next) != NULL) {
+		mtree_leaf_t *next = nleaf->next;
+		next->prev = nleaf;
+	}
 	nleaf->prev = leaf;
 	nleaf->parent = leaf->parent;
 
@@ -810,6 +862,9 @@ split_leaf_node(masstree_t *tree, mtree_node_t *node,
 	keynode = toright ? nnode : node;
 	leaf_insert_key(keynode, key, len, val);
 	leaf->next = nleaf;
+
+	NOSMP_ASSERT(validate_leaf(leaf));
+	NOSMP_ASSERT(validate_leaf(nleaf));
 
 	/*
 	 * Done with the leaves - any further ascending would be on the
@@ -840,11 +895,13 @@ ascend:
 		ASSERT(node_get_parent(node) == NULL);
 		ASSERT(node_get_parent(nnode) == NULL);
 
-		/* Long live new root! */
-		node->version &= ~NODE_ISROOT;
+		/*
+		 * Long live new root!  Unlock will clear NODE_ISROOT.
+		 */
 		node_set_parent(node, pnode);
 		node_set_parent(nnode, pnode);
 		parent = (mtree_node_t *)pnode;
+		NOSMP_ASSERT(validate_inode(pnode));
 
 		// XXX ok to be lockless?
 		if (tree->root == node) {
@@ -855,6 +912,7 @@ ascend:
 		goto done;
 	}
 	ASSERT(node_locked_p(parent));
+	NOSMP_ASSERT(validate_inode(cast_to_inode(parent)));
 
 	if (__predict_false(((mtree_inode_t *)parent)->nkeys == NODE_MAX)) {
 		mtree_node_t *inode;
@@ -953,6 +1011,7 @@ collapse_nodes(masstree_t *tree, mtree_node_t *node, uint64_t key)
 		goto reroot;
 	}
 	pnode = cast_to_inode(parent);
+	NOSMP_ASSERT(validate_inode(pnode));
 	unlock_node(node);
 	gclist_add(tree, node);
 
@@ -962,6 +1021,7 @@ collapse_nodes(masstree_t *tree, mtree_node_t *node, uint64_t key)
 			break;
 	pnode->child[i] = child;
 	node_set_parent(child, pnode);
+	NOSMP_ASSERT(validate_inode(pnode));
 	unlock_node(parent);
 	return false;
 reroot:
@@ -1006,6 +1066,11 @@ delete_leaf_node(masstree_t *tree, mtree_node_t *node, uint64_t key)
 	ASSERT(node_locked_p(node));
 	ASSERT((node->version & (NODE_INSERTING | NODE_SPLITTING)) == 0);
 
+	NOSMP_ASSERT(validate_leaf(leaf));
+	NOSMP_ASSERT(!leaf->prev || validate_leaf(leaf->prev));
+	NOSMP_ASSERT(!leaf->next || validate_leaf(leaf->next));
+	NOSMP_ASSERT(!leaf->parent || validate_inode(leaf->parent));
+
 	/*
 	 * Unlink the leaf from the doubly-linked list.
 	 *
@@ -1018,6 +1083,7 @@ delete_leaf_node(masstree_t *tree, mtree_node_t *node, uint64_t key)
 		if ((next->version & NODE_DELETED) == 0) {
 			break;
 		}
+		/* Race: our 'next' pointer should be updated. */
 		unlock_node(next);
 	}
 	node->version |= NODE_DELETED;
@@ -1040,8 +1106,13 @@ delete_leaf_node(masstree_t *tree, mtree_node_t *node, uint64_t key)
 		}
 	}
 	if (next) {
+		mtree_leaf_t *nextl = cast_to_leaf(next);
+		nextl->prev = leaf->prev;
 		unlock_node(next);
 	}
+
+	NOSMP_ASSERT(!leaf->prev || validate_leaf(leaf->prev));
+	NOSMP_ASSERT(!leaf->next || validate_leaf(leaf->next));
 
 	/*
 	 * Collapse the intermediate nodes (note: releases the leaf lock).
@@ -1106,6 +1177,7 @@ retry:
 		/* The node was modified - retry. */
 		v = nv;
 	}
+	NOSMP_ASSERT(validate_leaf(cast_to_leaf(node)));
 
 	*rv = v;
 	return cast_to_leaf(node);
@@ -1295,6 +1367,7 @@ retry:
 		/* The node is full: perform the split processing. */
 		node = split_leaf_node(tree, node, skey, slen, sval);
 		leaf = cast_to_leaf(node);
+		NOSMP_ASSERT(validate_leaf(leaf));
 	}
 	if (slen & MTREE_LAYER) {
 		/* The new layer has been inserted.  Make it stable. */
@@ -1334,6 +1407,7 @@ retry:
 	}
 	idx = leaf_find_lv(leaf, skey, slen, &type);
 	node = (mtree_node_t *)leaf;
+	NOSMP_ASSERT(!leaf->parent || validate_inode(leaf->parent));
 
 	/*
 	 * If we have to cleanup the layer: either find and set the a
@@ -1374,6 +1448,7 @@ retry:
 			unlock_node(node);
 			return true;
 		}
+		NOSMP_ASSERT(!leaf->parent || validate_inode(leaf->parent));
 
 		/* It was the last key: deleting the whole leaf. */
 		if (!delete_leaf_node(tree, node, skey)) {

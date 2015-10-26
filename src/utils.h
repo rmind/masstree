@@ -123,6 +123,11 @@ flsll(unsigned long long x)
 #if !defined(ASSERT)
 #define	ASSERT		assert
 #endif
+#if defined(NOSMP)
+#define	NOSMP_ASSERT	assert
+#else
+#define	NOSMP_ASSERT	assert
+#endif
 
 /*
  * Compile-time assertion: if C11 static_assert() is not available,

@@ -165,10 +165,10 @@ main(void)
 {
 	node_locking_test();
 	leaf_ops_test();
-	inode_ops_test();
+	//inode_ops_test();
 
 	random_keyval_test();
-	//random_del_test();
+	random_del_test();
 
 	puts("ok");
 	return 0;
