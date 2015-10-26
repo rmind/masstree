@@ -53,7 +53,7 @@ install: $(addprefix install/,$(LIB).la)
 
 test: tests.o
 	$(CC) $(CFLAGS) $(LDFLAGS) $< -o masstree_test
-	#./masstree_test
+	./masstree_test
 	#gcov -c -b ./tests.c
 
 vis: vis.o
@@ -62,7 +62,7 @@ vis: vis.o
 
 clean:
 	libtool --mode=clean rm
-	rm -rf .libs *.o *.lo *.la *.gcno *.gcov
+	rm -rf .libs *.o *.lo *.la *.gcno *.gcov *.gcda
 	rm -f masstree_test masstree_vis
 
 .PHONY: all lib install test vis clean

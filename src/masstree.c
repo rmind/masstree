@@ -273,14 +273,9 @@ validate_inode(const mtree_inode_t *inode)
 	for (unsigned i = 0; i < nkeys + 1; i++) {
 		uint32_t v = inode->child[i]->version;
 
-		if (v & NODE_DELETED)
-			continue;
-		if (v & NODE_ISBORDER) {
+		if ((v & NODE_DELETED) == 0 && (v & NODE_ISBORDER) != 0) {
 			mtree_leaf_t *leaf = cast_to_leaf(inode->child[i]);
 			NOSMP_ASSERT(validate_leaf(leaf));
-		} else {
-			mtree_inode_t *c = cast_to_inode(inode->child[i]);
-			NOSMP_ASSERT(validate_inode(c));
 		}
 	}
 	return true;

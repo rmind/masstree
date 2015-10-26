@@ -82,39 +82,23 @@
 #define	MIN(x, y)	((x) < (y) ? (x) : (y))
 #endif
 
-#ifndef MAN
+#ifndef MAX
 #define	MAX(x, y)	((x) > (y) ? (x) : (y))
 #endif
 
-#define	roundup(x, y)	((((x)+((y)-1))/(y))*(y))
-#define	rounddown(x,y)	(((x)/(y))*(y))
-#define	roundup2(x, m)	(((x) + (m) - 1) & ~((m) - 1))
-
 /*
- * Maths helpers: log2 on integer, fast division and remainder.
+ * Byte-order.
  */
 
-#ifndef flsl
-static inline int
-flsl(unsigned long x)
-{
-	return __predict_true(x) ?
-	    (sizeof(unsigned long) * CHAR_BIT) - __builtin_clzl(x) : 0;
-}
-#define	flsl(x)		flsl(x)
+#ifndef htobe64
+#ifdef __APPLE__
+#include <libkern/OSByteOrder.h>
+#define	htobe64(x)	OSSwapHostToBigInt64(x)
 #endif
-#ifndef flsll
-static inline int
-flsll(unsigned long long x)
-{
-	return __predict_true(x) ?
-	    (sizeof(unsigned long long) * CHAR_BIT) - __builtin_clzll(x) : 0;
-}
-#define	flsll(x)	flsl(x)
+#ifdef __linux__
+#define _BSD_SOURCE
+#include <endian.h>
 #endif
-
-#ifndef ilog2
-#define	ilog2(x)	(flsl(x) - 1)
 #endif
 
 /*
@@ -176,7 +160,9 @@ atomic_exchange(volatile void *ptr, void *nptr)
  * memory_order_acquire	- membar_consumer/smp_rmb
  * memory_order_release	- membar_producer/smp_wmb
  */
-#define	atomic_thread_fence(m)	__sync_synchronize()
+#define	memory_order_acquire	//__atomic_thread_fence(__ATOMIC_ACQUIRE)
+#define	memory_order_release	//__atomic_thread_fence(__ATOMIC_RELEASE)
+#define	atomic_thread_fence(m)	m
 #endif
 
 /*
