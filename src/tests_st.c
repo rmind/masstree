@@ -8,6 +8,8 @@
 #include <stdio.h>
 #include <time.h>
 #include <assert.h>
+#include <errno.h>
+#include <err.h>
 
 #include "masstree.c"
 

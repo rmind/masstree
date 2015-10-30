@@ -9,7 +9,11 @@ CFLAGS+=	-Wshadow -Wcast-qual -Wwrite-strings
 ifeq ($(DEBUG),1)
 DEBUG=		1
 endif
-ifeq ($(MAKECMDGOALS),test)
+ifeq ($(MAKECMDGOALS),test_st)
+CFLAGS+=	-DNOSMP
+DEBUG=		1
+endif
+ifeq ($(MAKECMDGOALS),test_mt)
 DEBUG=		1
 endif
 ifeq ($(MAKECMDGOALS),vis)
@@ -51,10 +55,19 @@ install: $(addprefix install/,$(LIB).la)
 	mkdir -p $(IINCDIR) && install -c $(INCS) $(IINCDIR)
 	#mkdir -p $(IMANDIR) && install -c $(MANS) $(IMANDIR)
 
-test: tests.o
-	$(CC) $(CFLAGS) $(LDFLAGS) $< -o masstree_test
-	./masstree_test
-	#gcov -c -b ./tests.c
+tests_st: tests_st.o
+	$(CC) $(CFLAGS) $(LDFLAGS) $< -o masstree_st_test -lpthread
+
+tests_mt: tests_mt.o
+	$(CC) $(CFLAGS) $(LDFLAGS) $< -o masstree_mt_test -lpthread
+
+test:
+	$(MAKE) tests_st
+	$(MAKE) tests_mt
+	./masstree_st_test
+	#gcov -c -b ./tests_st.c
+	./masstree_mt_test
+	#gcov -c -b ./tests_mt.c
 
 vis: vis.o
 	$(CC) $(CFLAGS) $(LDFLAGS) $< -o masstree_vis
@@ -63,6 +76,6 @@ vis: vis.o
 clean:
 	libtool --mode=clean rm
 	rm -rf .libs *.o *.lo *.la *.gcno *.gcov *.gcda
-	rm -f masstree_test masstree_vis
+	rm -f masstree_st_test masstree_mt_test masstree_vis
 
 .PHONY: all lib install test vis clean

@@ -110,7 +110,7 @@
 #if defined(NOSMP)
 #define	NOSMP_ASSERT	assert
 #else
-#define	NOSMP_ASSERT	assert
+#define	NOSMP_ASSERT
 #endif
 
 /*
@@ -160,8 +160,8 @@ atomic_exchange(volatile void *ptr, void *nptr)
  * memory_order_acquire	- membar_consumer/smp_rmb
  * memory_order_release	- membar_producer/smp_wmb
  */
-#define	memory_order_acquire	//__atomic_thread_fence(__ATOMIC_ACQUIRE)
-#define	memory_order_release	//__atomic_thread_fence(__ATOMIC_RELEASE)
+#define	memory_order_acquire	__atomic_thread_fence(__ATOMIC_ACQUIRE)
+#define	memory_order_release	__atomic_thread_fence(__ATOMIC_RELEASE)
 #define	atomic_thread_fence(m)	m
 #endif
 
