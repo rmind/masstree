@@ -9,11 +9,11 @@ CFLAGS+=	-Wshadow -Wcast-qual -Wwrite-strings
 ifeq ($(DEBUG),1)
 DEBUG=		1
 endif
-ifeq ($(MAKECMDGOALS),test_st)
+ifeq ($(MAKECMDGOALS),tests_st)
 CFLAGS+=	-DNOSMP
 DEBUG=		1
 endif
-ifeq ($(MAKECMDGOALS),test_mt)
+ifeq ($(MAKECMDGOALS),tests_mt)
 DEBUG=		1
 endif
 ifeq ($(MAKECMDGOALS),vis)
@@ -76,6 +76,6 @@ vis: vis.o
 clean:
 	libtool --mode=clean rm
 	rm -rf .libs *.o *.lo *.la *.gcno *.gcov *.gcda
-	rm -f masstree_st_test masstree_mt_test masstree_vis
+	rm -f masstree_vis
 
 .PHONY: all lib install test vis clean

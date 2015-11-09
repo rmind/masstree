@@ -35,6 +35,7 @@
  *
  * - Keys are sliced into 64-bits per layer of the trie.
  * - Each layer is a B+ tree with fanout 16.
+ * - Splits are only to-the-right; merges are not performed.
  *
  * Concurrency in a nutshell:
  *
@@ -63,15 +64,23 @@
  *   the readers either a) retry from the root b) use walk_leaves() to
  *   find check the split leaves on the right side.
  *
- * - LAYERING: The tree within a layer may: a) get a new root (due to
- *   to split or collapse)  b) be entirely collapsed and thus removed.
- *   In both cases, the leaf of the upper layer is updated by walking
- *   the tree again from the top layer.  The stale root pointer is not
- *   a problem due root walk-up which will be caused either by the split
- *   flag or NODE_ISROOT absence.  The layer deletion, however, results
- *   in the NODE_DELETED flag set on the lower layer root, thus failing
- *   all readers as well as writers operating on the layer.  This has
- *   an effect of "locking" its upper key slice.
+ * - ROOT CHANGE AND LAYERING: The tree within a layer may: a) get a new
+ *   root due to a split or collapse  b) be entirely collapsed and thus
+ *   removed.  If the split count changes, find_leaf() will retry from
+ *   the root.  The NODE_ISROOT flag is used to trigger walk_to_root() in
+ *   order to find the real (new) root.  Partial collapse will set the
+ *   NODE_DELETED flag which will also cause a re-try.
+ *
+ *   In a case of a layer deletion, the leaf of the upper layer is updated
+ *   by walking the tree again from the top layer.  The NODE_DELETED flag
+ *   is set on the lower layer root, thus failing all readers as well as
+ *   writers operating on the layer.  This has an effect of "locking" its
+ *   upper key slice.
+ *
+ *   Similarly, fixup of the root pointer is performed when the root just
+ *   changes.  Note that the stale root pointer is not a problem because
+ *   of the root walk-up which will be caused either by a split counter or
+ *   NODE_ISROOT absence.
  *
  * - LOCKING AND LOCK ORDER: Nodes are locked bottom-up, but top-down
  *   across the layers.  They may also be locked left-to-right (think of
@@ -106,6 +115,13 @@
 #define	NODE_DELETED		(1U << 3)	// indicate node deletion
 #define	NODE_ISROOT		(1U << 4)	// indicate root of B+ tree
 #define	NODE_ISBORDER		(1U << 5)	// indicate border node
+#define	NODE_DELAYER		(1U << 31)	// layer deletion
+
+/*
+ * Note: insert and split counter bit fields are adjacent such that
+ * the inserts may overflow into the split.  That is, 7 + 18 bits in
+ * total, thus making 2^25 the real overflow.
+ */
 
 #define	NODE_VINSERT		0x00001fc0	// insert counter (bits 6-13)
 #define	NODE_VINSERT_SHIFT	6
@@ -122,7 +138,7 @@ typedef struct mtree_leaf mtree_leaf_t;
  */
 typedef struct {
 	uint32_t	version;
-	uint32_t	_pad;
+	void *		gc_next;
 } mtree_node_t;
 
 #define	NODE_MAX	15
@@ -196,9 +212,9 @@ struct mtree_leaf {
 
 struct masstree {
 	mtree_node_t *		root;
-	mtree_leaf_t		initleaf;
 	mtree_node_t *		gc_nodes;
 	const masstree_ops_t *	ops;
+	mtree_leaf_t		initleaf;
 };
 
 /*
@@ -325,6 +341,7 @@ again:
 	if (!atomic_compare_exchange_weak(&node->version, v, v | NODE_LOCKED))
 		goto again;
 
+	/* XXX: Use atomic_compare_exchange_weak_explicit() instead. */
 	atomic_thread_fence(memory_order_acquire);
 }
 
@@ -337,7 +354,8 @@ unlock_node(mtree_node_t *node)
 
 	/*
 	 * Increment the counter (either for insert or split).
-	 * Clear NODE_ISROOT if split occured, it has a parent now.
+	 * - Inserts can overflow into splits (since the range is small).
+	 * - Clear NODE_ISROOT if split occured, it has a parent now.
 	 */
 	if (v & NODE_INSERTING) {
 		uint32_t c = (v & NODE_VINSERT) + (1 << NODE_VINSERT_SHIFT);
@@ -345,7 +363,7 @@ unlock_node(mtree_node_t *node)
 	}
 	if (v & NODE_SPLITTING) {
 		uint32_t c = (v & NODE_VSPLIT) + (1 << NODE_VSPLIT_SHIFT);
-		v = ((v & ~NODE_ISROOT) & ~NODE_VSPLIT) | c;
+		v = ((v & ~NODE_ISROOT) & ~NODE_VSPLIT) | (c & NODE_VSPLIT);
 	}
 
 	/* Release the lock and clear the operation flags. */
@@ -354,6 +372,25 @@ unlock_node(mtree_node_t *node)
 	/* Note: store on an integer is atomic. */
 	atomic_thread_fence(memory_order_release);
 	node->version = v;
+}
+
+/*
+ * unlock_gc_node: release the lock of the deleted node and stage it
+ * for the garbage collection.
+ */
+static void
+unlock_gc_node(masstree_t *tree, mtree_node_t *node)
+{
+	mtree_node_t *gclist;
+
+	/* The node must be deleted; unlock it. */
+	ASSERT((node->version & (NODE_DELETED | NODE_DELAYER)) != 0);
+	unlock_node(node);
+
+	do {
+		gclist = tree->gc_nodes;
+		node->gc_next = gclist;
+	} while (!atomic_compare_exchange_weak(&tree->gc_nodes, gclist, node));
 }
 
 static inline mtree_node_t *
@@ -419,26 +456,10 @@ key_geq(const mtree_leaf_t *leaf, uint64_t key, unsigned len)
 	const unsigned idx = PERM_KEYIDX(perm, 0);
 	const uint64_t slice = leaf->keyslice[idx];
 	const unsigned slen = KEY_LLEN(leaf->keyinfo[idx]);
+	const bool empty = PERM_NKEYS(perm) == 0;
 
 	ASSERT((leaf->version & NODE_ISBORDER) != 0);
-	ASSERT(PERM_NKEYS(perm) > 0);
-
-	return key > slice || (key == slice && len >= slen);
-}
-
-static void
-gclist_add(masstree_t *tree, mtree_node_t *node)
-{
-	mtree_node_t *gclist;
-
-	ASSERT((node->version & NODE_DELETED) != 0);
-	do {
-		/*
-		 * We are abusing the parent pointer for the G/C list.
-		 */
-		gclist = tree->gc_nodes;
-		node_set_parent(node, (mtree_inode_t *)gclist);
-	} while (!atomic_compare_exchange_weak(&tree->gc_nodes, gclist, node));
+	return !empty && (key > slice || (key == slice && len >= slen));
 }
 
 /*
@@ -471,15 +492,14 @@ leaf_find_lv(const mtree_leaf_t *leaf, uint64_t key,
 	for (i = 0; i < nkeys; i++) {
 		const unsigned idx = PERM_KEYIDX(perm, i);
 		const uint64_t slice = leaf->keyslice[idx];
-		const unsigned llen = leaf->keyinfo[idx];
-		const unsigned klen = KEY_LLEN(llen);
+		const unsigned sinfo = leaf->keyinfo[idx];
 
-		if (key < slice)
-			break;
-		if (key == slice && kinfo == klen) {
-			*type = KEY_TYPE(llen);
+		if (key == slice && kinfo == KEY_LLEN(sinfo)) {
+			*type = KEY_TYPE(sinfo);
 			return idx;
 		}
+		if (key < slice)
+			break;
 	}
 	*type = MTREE_NOTFOUND;
 	return 0;
@@ -886,7 +906,6 @@ ascend:
 
 		ASSERT(node->version & (NODE_SPLITTING | NODE_INSERTING));
 		ASSERT(node->version & NODE_ISROOT);
-		ASSERT(tree->root == node);
 		ASSERT(node_get_parent(node) == NULL);
 		ASSERT(node_get_parent(nnode) == NULL);
 
@@ -898,7 +917,7 @@ ascend:
 		parent = (mtree_node_t *)pnode;
 		NOSMP_ASSERT(validate_inode(pnode));
 
-		// XXX ok to be lockless?
+		/* Note: top-root pointer is protected by the node lock. */
 		if (tree->root == node) {
 			tree->root = parent;
 		}
@@ -963,20 +982,21 @@ static bool
 collapse_nodes(masstree_t *tree, mtree_node_t *node, uint64_t key)
 {
 	mtree_node_t *parent, *child = NULL;
-	mtree_inode_t *pnode;
+	bool sublayer = true;
 	unsigned i;
 
 	ASSERT(node->version & NODE_DELETED);
+	ASSERT(tree->root != node);
 
 	/*
 	 * Lock the parent.  If there is no parent, then the leaf is
-	 * the root of a layer.
+	 * the root of a layer (but not the top layer).
 	 */
 	if ((parent = lock_parent_node(node)) == NULL) {
+		ASSERT(node->version & NODE_ISROOT);
 		goto reroot;
 	}
-	unlock_node(node);
-	gclist_add(tree, node);
+	unlock_gc_node(tree, node);
 
 	/* Fail the readers by pretending the insertion. */
 	ASSERT((parent->version & NODE_DELETED) == 0);
@@ -997,53 +1017,51 @@ collapse_nodes(masstree_t *tree, mtree_node_t *node, uint64_t key)
 	 */
 	parent->version |= NODE_DELETED;
 	node = parent;
-	if ((parent = lock_parent_node(node)) == NULL) {
-		/* XXX locking */
-		lock_node(child);
-		child->version |= NODE_ISROOT;
-		node_set_parent(child, NULL);
-		unlock_node(child);
-		goto reroot;
-	}
-	pnode = cast_to_inode(parent);
-	NOSMP_ASSERT(validate_inode(pnode));
-	unlock_node(node);
-	gclist_add(tree, node);
+	if ((parent = lock_parent_node(node)) != NULL) {
+		mtree_inode_t *pnode = cast_to_inode(parent);
 
-	/* Assign the child, set its parent pointer. */
-	for (i = 0; i < pnode->nkeys; i++)
-		if (key < pnode->keyslice[i])
-			break;
-	pnode->child[i] = child;
-	node_set_parent(child, pnode);
-	NOSMP_ASSERT(validate_inode(pnode));
-	unlock_node(parent);
-	return false;
-reroot:
-	ASSERT(node->version & NODE_ISROOT);
-	unlock_node(node);
-	gclist_add(tree, node);
+		NOSMP_ASSERT(validate_inode(pnode));
+		unlock_gc_node(tree, node);
 
-	/*
-	 * If this is the first level, then create a fresh leaf and
-	 * set the new root.  Note that the our leaf (the old root) is
-	 * marked as "deleted" - all traversal attempts are retrying
-	 * and we are a sole owner; set the root locklessly.
-	 */
-	if (tree->root == node) {
-		if (!child) {
-			mtree_leaf_t *leaf = leaf_create(tree);
-			leaf->version |= NODE_ISROOT;
-			atomic_thread_fence(memory_order_release);
-			tree->root = (mtree_node_t *)leaf;
-		} else {
-			tree->root = (mtree_node_t *)child;
-		}
+		/* Assign the child, set its parent pointer. */
+		for (i = 0; i < pnode->nkeys; i++)
+			if (key < pnode->keyslice[i])
+				break;
+		pnode->child[i] = child;
+		node_set_parent(child, pnode);
+		NOSMP_ASSERT(validate_inode(pnode));
+		unlock_node(parent);
 		return false;
 	}
 
+	/*
+	 * No parent: the child must become the new root.
+	 *
+	 * - The deleted internode, however, is still being the root of
+	 *   the layer; clear the NODE_ISROOT pointer and set the parent
+	 *   pointer to to child, so the readers would retry from there.
+	 *
+	 * - Set the child's parent pointer to NULL as its parent has
+	 *   just been marked as deleted.  At this point, concurrent
+	 *   split or deletion of the child itself may happen.
+	 */
+	ASSERT(node->version & NODE_ISROOT);
+	node->version &= ~NODE_ISROOT;
+	node_set_parent(node, (mtree_inode_t *)child);
+	if (tree->root == node) {
+		tree->root = child;
+		sublayer = false;
+	}
+	atomic_thread_fence(memory_order_release);
+
+	child->version |= NODE_ISROOT; // XXX
+	node_set_parent(child, NULL);
+reroot:
+	//node->version = (node->version & ~NODE_DELETED) | NODE_DELAYER;
+	unlock_gc_node(tree, node);
+
 	/* Indicate that the upper layer needs a clean up. */
-	return true;
+	return sublayer;
 }
 
 /*
@@ -1065,6 +1083,16 @@ delete_leaf_node(masstree_t *tree, mtree_node_t *node, uint64_t key)
 	NOSMP_ASSERT(!leaf->prev || validate_leaf(leaf->prev));
 	NOSMP_ASSERT(!leaf->next || validate_leaf(leaf->next));
 	NOSMP_ASSERT(!leaf->parent || validate_inode(leaf->parent));
+
+	/*
+	 * If this is the top level leaf, then we merely keep it empty.
+	 */
+	if (tree->root == node) {
+		ASSERT(node_get_parent(node) == NULL);
+		ASSERT(node->version & NODE_ISROOT);
+		unlock_node(node);
+		return false;
+	}
 
 	/*
 	 * Unlink the leaf from the doubly-linked list.
@@ -1147,7 +1175,7 @@ retry:
 
 		/* Fetch the child node and get its state. */
 		cnode = internode_lookup(node, key);
-		cv = stable_version(cnode);
+		cv = stable_version(cnode); // memory_order_acquire
 
 		/*
 		 * Check that the version has not changed.  Somebody may
@@ -1191,9 +1219,7 @@ walk_leaves(mtree_leaf_t *leaf, uint64_t skey, unsigned slen, uint32_t *vp)
 	 * nodes split *only* to-the-right, therefore such iteration
 	 * is reliable.
 	 *
-	 * First, fetch the stable version and check whether it was
-	 * a split.  If it was a deletion, then the caller will have
-	 * to restart.
+	 * Note: we check the current leaf first.
 	 */
 	v = stable_version((mtree_node_t *)leaf);
 	next = leaf->next;
@@ -1216,7 +1242,7 @@ static mtree_leaf_t *
 find_leaf_locked(mtree_node_t *root, uint64_t skey, unsigned slen)
 {
 	mtree_leaf_t *leaf;
-	uint32_t v;
+	uint32_t v, nvc;
 
 	/*
 	 * Perform the same lookup logic as in masstree_get(), but lock
@@ -1225,19 +1251,17 @@ find_leaf_locked(mtree_node_t *root, uint64_t skey, unsigned slen)
 	leaf = find_leaf(root, skey, &v);
 forward:
 	if (__predict_false(v & NODE_DELETED)) {
-		/*
-		 * Tell the caller to re-try.  We let the caller do it
-		 * as it may also pick a new root.
-		 */
+		/* Tell the caller to re-try from top root. */
 		return NULL;
 	}
 
 	/*
-	 * Lock!  Perform the same check-version dance.  Note that
-	 * lock_node() issues a read memory barrier for us.
+	 * Lock!  Check the split counter and re-check the delete flag.
+	 * Note that lock_node() issues a read memory barrier for us.
 	 */
 	lock_node((mtree_node_t *)leaf);
-	if ((leaf->version ^ v) > NODE_LOCKED) {
+	nvc = leaf->version & (NODE_VSPLIT | NODE_DELETED);
+	if (__predict_false(nvc != (v & NODE_VSPLIT))) {
 		unlock_node((mtree_node_t *)leaf);
 		leaf = walk_leaves(leaf, skey, slen, &v);
 		goto forward;
@@ -1268,8 +1292,7 @@ retry:
 	leaf = find_leaf(root, skey, &v);
 forward:
 	if (__predict_false(v & NODE_DELETED)) {
-		/* We have collided with the deletion.  Try again. */
-		root = tree->root, l = 0;
+		/* Collided with deletion - try again from the root. */
 		goto retry;
 	}
 
@@ -1320,15 +1343,16 @@ masstree_put(masstree_t *tree, const void *key, size_t len, void *val)
 	uint64_t skey;
 advance:
 	skey = fetch_word64(key, len, &l, &slen);
-retry:
+
 	/* Lookup the leaf and lock it (returns stable version). */
 	leaf = find_leaf_locked(root, skey, slen);
 	if (__predict_false(leaf == NULL)) {
 		root = tree->root, l = 0;
-		goto retry;
+		goto advance;
 	}
 	idx = leaf_find_lv(leaf, skey, slen, &type);
 	node = (mtree_node_t *)leaf;
+	NOSMP_ASSERT(!leaf->parent || validate_inode(leaf->parent));
 
 	if (type == MTREE_VALUE) {
 		/* The key was found: store a new value. */
@@ -1337,8 +1361,14 @@ retry:
 		return false;
 	}
 	if (type == MTREE_LAYER) {
-		/* Continue to the next layer. */
+		/*
+		 * Continue to the next layer.  Fixup the pointer to
+		 * point to the real root, if necessary.
+		 */
 		root = leaf->lv[idx];
+		if ((root->version & NODE_ISROOT) == 0) {
+			root = leaf->lv[idx] = walk_to_root(root);
+		}
 		unlock_node(node);
 		goto advance;
 	}
@@ -1355,6 +1385,7 @@ retry:
 		ASSERT(slen & MTREE_LAYER);
 		slen |= MTREE_UNSTABLE;
 		root = sval = nlayer;
+		atomic_thread_fence(memory_order_release);
 	}
 
 	/* The key was not found: insert it. */
@@ -1367,6 +1398,7 @@ retry:
 	if (slen & MTREE_LAYER) {
 		/* The new layer has been inserted.  Make it stable. */
 		idx = leaf_find_lv(leaf, skey, KEY_LLEN(slen), &type); // XXX
+		atomic_thread_fence(memory_order_release);
 		leaf->keyinfo[idx] &= ~MTREE_UNSTABLE;
 		unlock_node(node);
 
@@ -1392,13 +1424,12 @@ masstree_del(masstree_t *tree, const void *key, size_t len)
 	uint64_t skey;
 advance:
 	skey = fetch_word64(key, len, &l, &slen);
-retry:
-	/* Lookup the leaf node and lock it (returns stable version). */
+
+	/* Lookup the leaf and lock it (returns stable version). */
 	leaf = find_leaf_locked(root, skey, slen);
 	if (__predict_false(leaf == NULL)) {
-		/* Re-fetch the root leaf. */
 		root = tree->root, l = 0;
-		goto retry;
+		goto advance;
 	}
 	idx = leaf_find_lv(leaf, skey, slen, &type);
 	node = (mtree_node_t *)leaf;
@@ -1419,15 +1450,11 @@ retry:
 		 */
 		layer = leaf->lv[idx];
 		if ((layer->version & NODE_ISROOT) == 0) {
-			layer = walk_to_root(node);
-			leaf->lv[idx] = layer;
+			leaf->lv[idx] = walk_to_root(layer);
 			unlock_node(node);
 			return true;
 		}
-		if ((layer->version & NODE_DELETED) == 0) {
-			unlock_node(node);
-			return true;
-		}
+		ASSERT(layer->version & NODE_DELETED);
 		ASSERT(layer->version & NODE_ISROOT);
 
 		/* Delete the layer key. */
@@ -1463,6 +1490,9 @@ retry:
 		/* Continue to the next layer. */
 		ASSERT((slen & MTREE_LAYER) != 0);
 		root = leaf->lv[idx];
+		if ((root->version & NODE_ISROOT) == 0) {
+			root = leaf->lv[idx] = walk_to_root(root);
+		}
 		unlock_node(node);
 		goto advance;
 	}
@@ -1476,19 +1506,24 @@ retry:
 	return false;
 }
 
+void *
+masstree_gc_prepare(masstree_t *tree)
+{
+	return atomic_exchange(&tree->gc_nodes, NULL);
+}
+
 /*
  * masstree_gc: destroy all the garbage-collected nodes.
  */
 void
-masstree_gc(masstree_t *tree)
+masstree_gc(masstree_t *tree, void *gc)
 {
 	const masstree_ops_t *ops = tree->ops;
-	mtree_node_t *node, *next;
+	mtree_node_t *node = gc, *next;
 
-	node = atomic_exchange(&tree->gc_nodes, NULL);
 	while (node) {
 		ASSERT((node->version & NODE_DELETED) != 0);
-		next = node_get_parent(node);
+		next = node->gc_next;
 		if (node != (mtree_node_t *)&tree->initleaf) {
 			ops->free(node, (node->version & NODE_ISBORDER) ?
 			    sizeof(mtree_leaf_t) : sizeof(mtree_inode_t));

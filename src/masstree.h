@@ -42,7 +42,8 @@ typedef struct {
 
 masstree_t *	masstree_create(const masstree_ops_t *);
 void		masstree_destroy(masstree_t *);
-void		masstree_gc(masstree_t *);
+void *		masstree_gc_prepare(masstree_t *);
+void		masstree_gc(masstree_t *, void *);
 size_t		masstree_maxheight(void);
 
 void *		masstree_get(masstree_t *, const void *, size_t);
