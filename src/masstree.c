@@ -634,7 +634,7 @@ leaf_remove_key(mtree_node_t *node, uint64_t key, unsigned len)
 	leaf->permutation = nperm;
 	atomic_thread_fence(memory_order_release);
 
-	/* Indicate whether it was a last key. */
+	/* Indicate whether it was the last key. */
 	return (nkeys - 1) == 0;
 }
 
@@ -697,8 +697,10 @@ internode_insert(mtree_node_t *node, uint64_t key, mtree_node_t *child)
 	/* Insert the new key and the child. */
 	inode->keyslice[i] = key;
 	inode->child[i + 1] = child;
-	inode->nkeys++;
 	node_set_parent(child, inode);
+	atomic_thread_fence(memory_order_release);
+
+	inode->nkeys++;
 	NOSMP_ASSERT(validate_inode(inode));
 }
 
@@ -796,9 +798,8 @@ split_inter_node(masstree_t *tree, mtree_node_t *parent, uint64_t ckey,
  *
  * => If necessary, performs the splits up-tree.
  * => If the root node is reached, sets a new root for the tree.
- * => Returns the leaf where the key was inserted (keynode); it is locked.
  */
-static mtree_node_t *
+static void
 split_leaf_node(masstree_t *tree, mtree_node_t *node,
     uint64_t key, size_t len, void *val)
 {
@@ -845,8 +846,8 @@ split_leaf_node(masstree_t *tree, mtree_node_t *node,
 	 * - The 'parent' of the right-leaf will be set upon its insertion
 	 *   to the internode; only the splits use this pointer.
 	 *
-	 * - The left-leaf is locked and can set its 'next' pointer once
-	 *   the right-leaf is ready to be visible.
+	 * - The left-leaf is locked and its 'next' pointer can be set
+	 *   once the right-leaf is ready to be visible.
 	 *
 	 * - The 'prev' pointer of the leaf which is right to the
 	 *   right-leaf can also be updated since the original previous
@@ -910,20 +911,23 @@ ascend:
 		ASSERT(node_get_parent(nnode) == NULL);
 
 		/*
-		 * Long live new root!  Unlock will clear NODE_ISROOT.
+		 * Long live new root!  Note: the top-root pointer is
+		 * protected by the node lock.
 		 */
-		node_set_parent(node, pnode);
 		node_set_parent(nnode, pnode);
+		node_set_parent(node, pnode);
 		parent = (mtree_node_t *)pnode;
-		NOSMP_ASSERT(validate_inode(pnode));
 
-		/* Note: top-root pointer is protected by the node lock. */
 		if (tree->root == node) {
 			tree->root = parent;
 		}
+		NOSMP_ASSERT(validate_inode(pnode));
 
-		/* Release the locks. */
-		goto done;
+		/* Release the locks.  Unlock will clear NODE_ISROOT. */
+		unlock_node(parent);
+		unlock_node(nnode);
+		unlock_node(node);
+		return;
 	}
 	ASSERT(node_locked_p(parent));
 	NOSMP_ASSERT(validate_inode(cast_to_inode(parent)));
@@ -935,17 +939,12 @@ ascend:
 		 * The parent node is full - split and ascend.  We can
 		 * release the lock of the already existing child.
 		 */
-		if (node != keynode) {
-			unlock_node(node);
-		}
-
-		/* Note: the newly split leaf/node will be unlocked. */
+		unlock_node(node);
 		inode = split_inter_node(tree, parent, nkey, nnode, &nkey);
-		if (nnode != keynode) {
-			unlock_node(nnode);
-		}
-		nnode = inode;
+		unlock_node(nnode);
+
 		node = parent;
+		nnode = inode;
 
 		ASSERT(node_locked_p(nnode));
 		ASSERT(node_locked_p(node));
@@ -957,21 +956,13 @@ ascend:
 	 * and then insert the new node into our parent.
 	 */
 	parent->version |= NODE_INSERTING;
-	atomic_thread_fence(memory_order_release);
+	unlock_node(node); // memory_order_release
 	internode_insert(parent, nkey, nnode);
-done:
+
 	ASSERT(node_get_parent(nnode) == parent);
 	ASSERT(node_get_parent(node) == parent);
-
-	/* Release the locks, unless it is the keynode. */
+	unlock_node(nnode);
 	unlock_node(parent);
-	if (nnode != keynode)
-		unlock_node(nnode);
-	if (node != keynode)
-		unlock_node(node);
-
-	ASSERT(node_locked_p(keynode));
-	return keynode;
 }
 
 /*
@@ -1123,7 +1114,8 @@ delete_leaf_node(masstree_t *tree, mtree_node_t *node, uint64_t key)
 		bool ok;
 
 		v = stable_version(prev);
-		ok = atomic_compare_exchange_weak(&prevl->next, node, next);
+		ok = prevl->next == (mtree_leaf_t *)next ||
+		    atomic_compare_exchange_weak(&prevl->next, node, next);
 		if (ok && (prev->version ^ v) <= NODE_LOCKED) {
 			break;
 		}
@@ -1259,7 +1251,7 @@ forward:
 	 * Lock!  Check the split counter and re-check the delete flag.
 	 * Note that lock_node() issues a read memory barrier for us.
 	 */
-	lock_node((mtree_node_t *)leaf);
+	lock_node((mtree_node_t *)leaf); // memory_order_release
 	nvc = leaf->version & (NODE_VSPLIT | NODE_DELETED);
 	if (__predict_false(nvc != (v & NODE_VSPLIT))) {
 		unlock_node((mtree_node_t *)leaf);
@@ -1350,6 +1342,7 @@ advance:
 		root = tree->root, l = 0;
 		goto advance;
 	}
+next:
 	idx = leaf_find_lv(leaf, skey, slen, &type);
 	node = (mtree_node_t *)leaf;
 	NOSMP_ASSERT(!leaf->parent || validate_inode(leaf->parent));
@@ -1376,37 +1369,36 @@ advance:
 	/* Note: cannot be MTREE_UNSTABLE as we acquired the lock. */
 	ASSERT(type == MTREE_NOTFOUND);
 
-	/* Create a new layer.  Make sure the key is unstable. */
+	/* Create a new layer. */
 	if (slen & MTREE_LAYER) {
 		mtree_leaf_t *nlayer;
 
 		nlayer = leaf_create(tree);
 		nlayer->version |= NODE_ISROOT;
-		ASSERT(slen & MTREE_LAYER);
-		slen |= MTREE_UNSTABLE;
+		//lock_node((mtree_node_t *)nlayer);
 		root = sval = nlayer;
-		atomic_thread_fence(memory_order_release);
 	}
 
 	/* The key was not found: insert it. */
 	if (!leaf_insert_key(node, skey, slen, sval)) {
 		/* The node is full: perform the split processing. */
-		node = split_leaf_node(tree, node, skey, slen, sval);
-		leaf = cast_to_leaf(node);
-		NOSMP_ASSERT(validate_leaf(leaf));
-	}
-	if (slen & MTREE_LAYER) {
-		/* The new layer has been inserted.  Make it stable. */
-		idx = leaf_find_lv(leaf, skey, KEY_LLEN(slen), &type); // XXX
-		atomic_thread_fence(memory_order_release);
-		leaf->keyinfo[idx] &= ~MTREE_UNSTABLE;
+		split_leaf_node(tree, node, skey, slen, sval);
+	} else {
 		unlock_node(node);
+	}
 
+	if (slen & MTREE_LAYER) {
+#if 0
+		/* Advance the key and jump into the next layer. */
+		skey = fetch_word64(key, len, &l, &slen);
+		leaf = cast_to_leaf(root), sval = val;
+		goto next;
+#else
 		/* Advance the key. */
 		sval = val;
 		goto advance;
+#endif
 	}
-	unlock_node(node);
 	return true;
 }
 
