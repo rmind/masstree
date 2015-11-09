@@ -472,9 +472,7 @@ leaf_create(const masstree_t *tree)
 	const masstree_ops_t *ops = tree->ops;
 	mtree_leaf_t *leaf;
 
-	if ((leaf = ops->alloc(sizeof(mtree_leaf_t))) == NULL) {
-		return NULL;
-	}
+	leaf = ops->alloc(sizeof(mtree_leaf_t));
 	memset(leaf, 0, sizeof(mtree_leaf_t));
 	leaf->version = NODE_ISBORDER;
 	return leaf;
@@ -648,9 +646,7 @@ internode_create(const masstree_t *tree)
 	const masstree_ops_t *ops = tree->ops;
 	mtree_inode_t *node;
 
-	if ((node = ops->alloc(sizeof(mtree_inode_t))) == NULL) {
-		return NULL;
-	}
+	node = ops->alloc(sizeof(mtree_inode_t));
 	memset(node, 0, sizeof(mtree_inode_t));
 	return node;
 }
@@ -1318,6 +1314,7 @@ forward:
 		root = lv;
 		goto advance;
 	}
+#if 0
 	if (__predict_false((type & ~MTREE_LAYER) == MTREE_UNSTABLE)) {
 		/*
 		 * The value is about to become MTREE_LAYER, unless remove
@@ -1325,6 +1322,7 @@ forward:
 		 */
 		goto forward;
 	}
+#endif
 	return NULL;
 }
 
@@ -1545,9 +1543,7 @@ masstree_create(const masstree_ops_t *ops)
 		};
 		ops = &default_ops;
 	}
-	if ((tree = ops->alloc(sizeof(masstree_t))) == NULL) {
-		return NULL;
-	}
+	tree = ops->alloc(sizeof(masstree_t));
 	memset(tree, 0, sizeof(masstree_t));
 	tree->ops = ops;
 

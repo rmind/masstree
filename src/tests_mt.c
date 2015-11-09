@@ -28,8 +28,8 @@ fuzz_put_del(void *arg)
 	pthread_barrier_wait(&barrier);
 	while (n--) {
 		/*
-		 * Key range of 32 values to trigger many contended splits
-		 * and collapse within the same layer.
+		 * Key range of 32 values to trigger many contended
+		 * splits and collapse within the same layer.
 		 */
 		uint64_t key = random() & 0x1f;
 
@@ -38,6 +38,12 @@ fuzz_put_del(void *arg)
 		} else {
 			masstree_del(tree, &key, sizeof(key));
 		}
+	}
+
+	/* Primary threads performs a clean-up. */
+	pthread_barrier_wait(&barrier);
+	if (id == 0) for (uint64_t key = 0; key <= 0x1f; key++) {
+		masstree_del(tree, &key, sizeof(key));
 	}
 	pthread_exit(NULL);
 	return NULL;
@@ -51,6 +57,10 @@ fuzz_multi(void *arg)
 
 	pthread_barrier_wait(&barrier);
 	while (n--) {
+		/*
+		 * Key range of 4k will create multiple internode
+		 * layers with some contention amongst them.
+		 */
 		uint64_t key = random() & 0xfff;
 		void *val;
 
@@ -68,6 +78,10 @@ fuzz_multi(void *arg)
 			break;
 		}
 	}
+	pthread_barrier_wait(&barrier);
+	if (id == 0) for (uint64_t key = 0; key <= 0xfff; key++) {
+		masstree_del(tree, &key, sizeof(key));
+	}
 	pthread_exit(NULL);
 	return NULL;
 }
@@ -84,6 +98,9 @@ fuzz_layers(void *arg)
 		uintptr_t numval;
 		void *val;
 
+		/*
+		 * Two layers, each contended to cause collapses.
+		 */
 		key[0] = random() & 0x1f;
 		key[1] = random() & 0x1f;
 		numval = key[0] ^ key[1];
@@ -99,6 +116,16 @@ fuzz_layers(void *arg)
 		case 2:
 			masstree_del(tree, key, sizeof(key));
 			break;
+		}
+	}
+
+	pthread_barrier_wait(&barrier);
+	if (id == 0) {
+		for (uint64_t k1 = 0; k1 <= 0x1f; k1++) {
+			for (uint64_t k2 = 0; k2 <= 0x1f; k2++) {
+				uint64_t key[2] = { k1, k2 };
+				masstree_del(tree, key, sizeof(key));
+			}
 		}
 	}
 	pthread_exit(NULL);
@@ -131,6 +158,7 @@ run_test(void *func(void *))
 
 	ref = masstree_gc_prepare(tree);
 	masstree_gc(tree, ref);
+	masstree_destroy(tree);
 }
 
 int
