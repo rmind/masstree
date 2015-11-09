@@ -974,7 +974,6 @@ collapse_nodes(masstree_t *tree, mtree_node_t *node, uint64_t key)
 {
 	mtree_node_t *parent, *child = NULL;
 	bool sublayer = true;
-	unsigned i;
 
 	ASSERT(node->version & NODE_DELETED);
 	ASSERT(tree->root != node);
@@ -985,7 +984,8 @@ collapse_nodes(masstree_t *tree, mtree_node_t *node, uint64_t key)
 	 */
 	if ((parent = lock_parent_node(node)) == NULL) {
 		ASSERT(node->version & NODE_ISROOT);
-		goto reroot;
+		unlock_gc_node(tree, node);
+		return true;
 	}
 	unlock_gc_node(tree, node);
 
@@ -1010,6 +1010,7 @@ collapse_nodes(masstree_t *tree, mtree_node_t *node, uint64_t key)
 	node = parent;
 	if ((parent = lock_parent_node(node)) != NULL) {
 		mtree_inode_t *pnode = cast_to_inode(parent);
+		unsigned i;
 
 		NOSMP_ASSERT(validate_inode(pnode));
 		unlock_gc_node(tree, node);
@@ -1030,7 +1031,7 @@ collapse_nodes(masstree_t *tree, mtree_node_t *node, uint64_t key)
 	 *
 	 * - The deleted internode, however, is still being the root of
 	 *   the layer; clear the NODE_ISROOT pointer and set the parent
-	 *   pointer to to child, so the readers would retry from there.
+	 *   pointer to child, so the readers would retry from there.
 	 *
 	 * - Set the child's parent pointer to NULL as its parent has
 	 *   just been marked as deleted.  At this point, concurrent
@@ -1038,21 +1039,29 @@ collapse_nodes(masstree_t *tree, mtree_node_t *node, uint64_t key)
 	 */
 	ASSERT(node->version & NODE_ISROOT);
 	node->version &= ~NODE_ISROOT;
+#if 0
 	node_set_parent(node, (mtree_inode_t *)child);
-	if (tree->root == node) {
-		tree->root = child;
-		sublayer = false;
-	}
 	atomic_thread_fence(memory_order_release);
 
 	child->version |= NODE_ISROOT; // XXX
 	node_set_parent(child, NULL);
-reroot:
-	//node->version = (node->version & ~NODE_DELETED) | NODE_DELAYER;
+	unlock_gc_node(tree, node);
+#else
+	node_set_parent(child, NULL);
 	unlock_gc_node(tree, node);
 
+	lock_node(child);
+	child->version |= NODE_ISROOT; // XXX
+	node_set_parent(node, (mtree_inode_t *)child);
+	unlock_node(child);
+#endif
+	if (tree->root == node) {
+		tree->root = child;
+		return false;
+	}
+
 	/* Indicate that the upper layer needs a clean up. */
-	return sublayer;
+	return true;
 }
 
 /*
@@ -1554,6 +1563,17 @@ void
 masstree_destroy(masstree_t *tree)
 {
 	const masstree_ops_t *ops = tree->ops;
+	mtree_leaf_t *root = cast_to_leaf(tree->root);
+
+	/* Diagnostics: check for non-empty tree. */
+	root = cast_to_leaf(tree->root);
+	ASSERT(PERM_NKEYS(root->permutation) == 0);
+	ASSERT(tree->gc_nodes == NULL);
+
+	/* Finally, free Masstree. */
+	if (&tree->initleaf != root) {
+		ops->free(root, sizeof(mtree_leaf_t));
+	}
 	ops->free(tree, sizeof(masstree_t));
 }
 

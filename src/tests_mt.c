@@ -20,27 +20,6 @@ static pthread_barrier_t	barrier;
 static unsigned			nworkers;
 
 static void *
-fuzz_put_get(void *arg)
-{
-	const unsigned id = (uintptr_t)arg;
-	unsigned n = 1000 * 1000;
-
-	pthread_barrier_wait(&barrier);
-	while (n--) {
-		uint64_t key = random() & 0xfff;
-
-		if (random() & 0x1) {
-			masstree_put(tree, &key, sizeof(key),
-			    (void *)(uintptr_t)key);
-		} else {
-			void *val = masstree_get(tree, &key, sizeof(key));
-			assert(!val || (uintptr_t)val == (uintptr_t)key);
-		}
-	}
-	return NULL;
-}
-
-static void *
 fuzz_put_del(void *arg)
 {
 	const unsigned id = (uintptr_t)arg;
@@ -48,6 +27,10 @@ fuzz_put_del(void *arg)
 
 	pthread_barrier_wait(&barrier);
 	while (n--) {
+		/*
+		 * Key range of 32 values to trigger many contended splits
+		 * and collapse within the same layer.
+		 */
 		uint64_t key = random() & 0x1f;
 
 		if (random() & 0x1) {
@@ -60,10 +43,73 @@ fuzz_put_del(void *arg)
 	return NULL;
 }
 
+static void *
+fuzz_multi(void *arg)
+{
+	const unsigned id = (uintptr_t)arg;
+	unsigned n = 1000 * 1000;
+
+	pthread_barrier_wait(&barrier);
+	while (n--) {
+		uint64_t key = random() & 0xfff;
+		void *val;
+
+		switch (random() % 3) {
+		case 0:
+			val = masstree_get(tree, &key, sizeof(key));
+			assert(!val || (uintptr_t)val == (uintptr_t)key);
+			break;
+		case 1:
+			masstree_put(tree, &key, sizeof(key),
+			    (void *)(uintptr_t)key);
+			break;
+		case 2:
+			masstree_del(tree, &key, sizeof(key));
+			break;
+		}
+	}
+	pthread_exit(NULL);
+	return NULL;
+}
+
+static void *
+fuzz_layers(void *arg)
+{
+	const unsigned id = (uintptr_t)arg;
+	unsigned n = 1000 * 1000;
+
+	pthread_barrier_wait(&barrier);
+	while (n--) {
+		uint64_t key[2];
+		uintptr_t numval;
+		void *val;
+
+		key[0] = random() & 0x1f;
+		key[1] = random() & 0x1f;
+		numval = key[0] ^ key[1];
+
+		switch (random() % 3) {
+		case 0:
+			val = masstree_get(tree, key, sizeof(key));
+			assert(!val || (uintptr_t)val == numval);
+			break;
+		case 1:
+			masstree_put(tree, key, sizeof(key), (void *)numval);
+			break;
+		case 2:
+			masstree_del(tree, key, sizeof(key));
+			break;
+		}
+	}
+	pthread_exit(NULL);
+	return NULL;
+}
+
 static void
 run_test(void *func(void *))
 {
 	pthread_t *thr;
+	void *ref;
 
 	srandom(1);
 	tree = masstree_create(NULL);
@@ -82,13 +128,17 @@ run_test(void *func(void *))
 		pthread_join(thr[i], NULL);
 	}
 	pthread_barrier_destroy(&barrier);
+
+	ref = masstree_gc_prepare(tree);
+	masstree_gc(tree, ref);
 }
 
 int
 main(void)
 {
-	run_test(fuzz_put_get);
 	run_test(fuzz_put_del);
+	run_test(fuzz_multi);
+	run_test(fuzz_layers);
 	puts("ok");
 	return 0;
 }
