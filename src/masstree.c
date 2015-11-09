@@ -411,7 +411,7 @@ walk_to_root(mtree_node_t *node)
 	mtree_node_t *parent;
 
 	while ((parent = node_get_parent(node)) != NULL) {
-		parent = node;
+		node = parent;
 	}
 	return node;
 }

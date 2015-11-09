@@ -20,7 +20,28 @@ static pthread_barrier_t	barrier;
 static unsigned			nworkers;
 
 static void *
-fuzz(void *arg)
+fuzz_put_get(void *arg)
+{
+	const unsigned id = (uintptr_t)arg;
+	unsigned n = 1000 * 1000;
+
+	pthread_barrier_wait(&barrier);
+	while (n--) {
+		uint64_t key = random() & 0xfff;
+
+		if (random() & 0x1) {
+			masstree_put(tree, &key, sizeof(key),
+			    (void *)(uintptr_t)key);
+		} else {
+			void *val = masstree_get(tree, &key, sizeof(key));
+			assert(!val || (uintptr_t)val == (uintptr_t)key);
+		}
+	}
+	return NULL;
+}
+
+static void *
+fuzz_put_del(void *arg)
 {
 	const unsigned id = (uintptr_t)arg;
 	unsigned n = 1000 * 1000;
@@ -35,6 +56,7 @@ fuzz(void *arg)
 			masstree_del(tree, &key, sizeof(key));
 		}
 	}
+	pthread_exit(NULL);
 	return NULL;
 }
 
@@ -65,7 +87,8 @@ run_test(void *func(void *))
 int
 main(void)
 {
-	run_test(fuzz);
+	run_test(fuzz_put_get);
+	run_test(fuzz_put_del);
 	puts("ok");
 	return 0;
 }

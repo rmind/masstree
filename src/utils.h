@@ -106,11 +106,13 @@
  */
 #if !defined(ASSERT)
 #define	ASSERT		assert
+#else
+#define	ASSERT(x)
 #endif
 #if defined(NOSMP)
 #define	NOSMP_ASSERT	assert
 #else
-#define	NOSMP_ASSERT
+#define	NOSMP_ASSERT(x)
 #endif
 
 /*
