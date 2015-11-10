@@ -39,9 +39,9 @@ fuzz_put_del(void *arg)
 			masstree_del(tree, &key, sizeof(key));
 		}
 	}
-
-	/* Primary threads performs a clean-up. */
 	pthread_barrier_wait(&barrier);
+
+	/* The primary thread performs the clean-up. */
 	if (id == 0) for (uint64_t key = 0; key <= 0x1f; key++) {
 		masstree_del(tree, &key, sizeof(key));
 	}
@@ -79,6 +79,7 @@ fuzz_multi(void *arg)
 		}
 	}
 	pthread_barrier_wait(&barrier);
+
 	if (id == 0) for (uint64_t key = 0; key <= 0xfff; key++) {
 		masstree_del(tree, &key, sizeof(key));
 	}
@@ -99,9 +100,10 @@ fuzz_layers(void *arg)
 		void *val;
 
 		/*
-		 * Two layers, each contended to cause collapses.
+		 * Two layers, contended to cause concurrent splits
+		 * and collapses.
 		 */
-		key[0] = random() & 0x1f;
+		key[0] = random() & 0xf;
 		key[1] = random() & 0x1f;
 		numval = key[0] ^ key[1];
 
@@ -118,10 +120,10 @@ fuzz_layers(void *arg)
 			break;
 		}
 	}
-
 	pthread_barrier_wait(&barrier);
+
 	if (id == 0) {
-		for (uint64_t k1 = 0; k1 <= 0x1f; k1++) {
+		for (uint64_t k1 = 0; k1 <= 0xf; k1++) {
 			for (uint64_t k2 = 0; k2 <= 0x1f; k2++) {
 				uint64_t key[2] = { k1, k2 };
 				masstree_del(tree, key, sizeof(key));

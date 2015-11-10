@@ -49,7 +49,7 @@
  *   the readers (which would spin retrying);
  *
  *   ii) the node destruction must be synchronised with the readers, e.g.
- *   by using passive serialisation or some other reclamation techniques.
+ *   by using Epoch-based reclamation or techniques.
  *
  * - WRITERS: Fine-grained locking is used, i.e. any modifications to a
  *   node must acquire per-node spinlock (NODE_LOCKED bit) which provides
@@ -975,11 +975,13 @@ collapse_nodes(masstree_t *tree, mtree_node_t *node, uint64_t key)
 	ASSERT(tree->root != node);
 
 	/*
-	 * Lock the parent.  If there is no parent, then the leaf is
-	 * the root of a layer (but not the top layer).
+	 * Lock the parent.  If there is no parent, then the leaf is the
+	 * root of a layer (but not the top layer).  Set the layer deletion
+	 * flag and indicate that the upper layer needs a cleanup.
 	 */
 	if ((parent = lock_parent_node(node)) == NULL) {
 		ASSERT(node->version & NODE_ISROOT);
+		node->version = (node->version & ~NODE_DELAYER) | NODE_DELAYER;
 		unlock_gc_node(tree, node);
 		return true;
 	}
@@ -1245,11 +1247,15 @@ find_leaf_locked(mtree_node_t *root, uint64_t skey, unsigned slen)
 	 * Perform the same lookup logic as in masstree_get(), but lock
 	 * the leaf once found and just re-lock if walking the leaves.
 	 */
+retry:
 	leaf = find_leaf(root, skey, &v);
 forward:
-	if (__predict_false(v & NODE_DELETED)) {
-		/* Tell the caller to re-try from top root. */
+	if (__predict_false(v & NODE_DELAYER)) {
+		/* Tell the caller to re-try from the top root. */
 		return NULL;
+	}
+	if (__predict_false(v & NODE_DELETED)) {
+		goto retry;
 	}
 
 	/*
@@ -1349,7 +1355,6 @@ advance:
 		root = tree->root, l = 0;
 		goto advance;
 	}
-next:
 	idx = leaf_find_lv(leaf, skey, slen, &type);
 	node = (mtree_node_t *)leaf;
 	NOSMP_ASSERT(!leaf->parent || validate_inode(leaf->parent));
@@ -1375,14 +1380,16 @@ next:
 
 	/* Note: cannot be MTREE_UNSTABLE as we acquired the lock. */
 	ASSERT(type == MTREE_NOTFOUND);
+newlayer:
+	ASSERT(node_locked_p(node));
 
 	/* Create a new layer. */
 	if (slen & MTREE_LAYER) {
 		mtree_leaf_t *nlayer;
 
 		nlayer = leaf_create(tree);
-		nlayer->version |= NODE_ISROOT;
-		//lock_node((mtree_node_t *)nlayer);
+		nlayer->version |= NODE_INSERTING | NODE_ISROOT;
+		lock_node((mtree_node_t *)nlayer);
 		root = sval = nlayer;
 	}
 
@@ -1395,16 +1402,10 @@ next:
 	}
 
 	if (slen & MTREE_LAYER) {
-#if 0
 		/* Advance the key and jump into the next layer. */
 		skey = fetch_word64(key, len, &l, &slen);
-		leaf = cast_to_leaf(root), sval = val;
-		goto next;
-#else
-		/* Advance the key. */
-		sval = val;
-		goto advance;
-#endif
+		sval = val, node = root;
+		goto newlayer;
 	}
 	return true;
 }
@@ -1434,34 +1435,8 @@ advance:
 	node = (mtree_node_t *)leaf;
 	NOSMP_ASSERT(!leaf->parent || validate_inode(leaf->parent));
 
-	/*
-	 * If we have to cleanup the layer: either find and set the a
-	 * new root or delete its key.
-	 */
-	if (l == cleanup) {
-		mtree_node_t *layer;
-
-		ASSERT(cleanup != 0);
-
-		/*
-		 * Check if it points to the root; otherwise, walk up to
-		 * the root and reset our pointer.
-		 */
-		layer = leaf->lv[idx];
-		if ((layer->version & NODE_ISROOT) == 0) {
-			leaf->lv[idx] = walk_to_root(layer);
-			unlock_node(node);
-			return true;
-		}
-		ASSERT(layer->version & NODE_DELETED);
-		ASSERT(layer->version & NODE_ISROOT);
-
-		/* Delete the layer key. */
-		slen = (slen & ~MTREE_VALUE) | MTREE_LAYER;
-		type = MTREE_VALUE;
-	}
-
 	if (type == MTREE_VALUE) {
+delayer:
 		ASSERT((slen & MTREE_LAYER) == 0 || cleanup);
 
 		/* The key was found: delete it. */
@@ -1488,9 +1463,31 @@ advance:
 	if (type == MTREE_LAYER) {
 		/* Continue to the next layer. */
 		ASSERT((slen & MTREE_LAYER) != 0);
+
+		/*
+		 * Check if it points to the real root; if not, walk up
+		 * to the real root and reset our pointer.
+		 */
 		root = leaf->lv[idx];
 		if ((root->version & NODE_ISROOT) == 0) {
 			root = leaf->lv[idx] = walk_to_root(root);
+		}
+
+		/*
+		 * If we re-traversed to perform a clean-up, then check
+		 * whether the layer was deleted and potentially remove
+		 * the key.  Otherwise, it was a root fixup which we or
+		 * a racing thread must have performed.  Just return.
+		 */
+		if (l == cleanup) {
+			ASSERT(cleanup != 0);
+
+			if (root->version & NODE_DELAYER) {
+				/* Delete the layer key. */
+				slen = (slen & ~MTREE_VALUE) | MTREE_LAYER;
+				goto delayer;
+			}
+			return true;
 		}
 		unlock_node(node);
 		goto advance;
