@@ -138,30 +138,21 @@ typedef struct mtree_leaf mtree_leaf_t;
  */
 typedef struct {
 	uint32_t	version;
-	void *		gc_next;
+	unsigned	_pad;
 } mtree_node_t;
 
 #define	NODE_MAX	15
 #define	NODE_PIVOT	7
 
-/*
- * The interior node: a regular node of the tree.  Assuming 64-bit system
- * and 64-byte cache-line size, the node up to the children pointers fits
- * in 2 cache-lines and the children pointers fit in 2 cache-lines.
- */
 struct mtree_inode {
 	uint32_t	version;
 	uint8_t		nkeys;
 	uint64_t	keyslice[NODE_MAX];
 	mtree_node_t *	child[NODE_MAX + 1];
 	mtree_inode_t *	parent;
+	mtree_node_t *	gc_next;
 };
 
-/*
- * The border node: it is a leaf of the tree, which may either point to
- * the data or another tree layer.  Note: the leaf meta-data up to 'lv'
- * fits in 3 cache-lines (152 bytes).
- */
 struct mtree_leaf {
 	uint32_t	version;
 	uint16_t	removed;
@@ -178,6 +169,7 @@ struct mtree_leaf {
 	 */
 	mtree_leaf_t *	prev;
 	mtree_inode_t *	parent;
+	mtree_node_t *	gc_next;
 };
 
 /*
@@ -389,7 +381,11 @@ unlock_gc_node(masstree_t *tree, mtree_node_t *node)
 
 	do {
 		gclist = tree->gc_nodes;
-		node->gc_next = gclist;
+		if (node->version & NODE_ISBORDER) {
+			cast_to_leaf(node)->gc_next = gclist;
+		} else {
+			cast_to_inode(node)->gc_next = gclist;
+		}
 	} while (!atomic_compare_exchange_weak(&tree->gc_nodes, gclist, node));
 }
 
@@ -455,11 +451,13 @@ key_geq(const mtree_leaf_t *leaf, uint64_t key, unsigned len)
 	const uint64_t perm = leaf->permutation;
 	const unsigned idx = PERM_KEYIDX(perm, 0);
 	const uint64_t slice = leaf->keyslice[idx];
-	const unsigned slen = KEY_LLEN(leaf->keyinfo[idx]);
-	const bool empty = PERM_NKEYS(perm) == 0;
+	//const unsigned slen = KEY_LLEN(leaf->keyinfo[idx]);
+	//const bool empty = PERM_NKEYS(perm) == 0;
+	(void)len;
 
 	ASSERT((leaf->version & NODE_ISBORDER) != 0);
-	return !empty && (key > slice || (key == slice && len >= slen));
+	//return !empty && (key > slice || (key == slice && len >= slen));
+	return PERM_NKEYS(perm) != 0 && key >= slice;
 }
 
 /*
@@ -800,7 +798,7 @@ split_leaf_node(masstree_t *tree, mtree_node_t *node,
     uint64_t key, size_t len, void *val)
 {
 	mtree_leaf_t *leaf = cast_to_leaf(node), *nleaf;
-	mtree_node_t *nnode, *parent, *keynode;
+	mtree_node_t *nnode, *parent;
 	uint64_t perm, nkey;
 	unsigned removed = 0;
 	bool toright;
@@ -815,7 +813,7 @@ split_leaf_node(masstree_t *tree, mtree_node_t *node,
 
 	nleaf = leaf_create(tree);
 	nnode = (mtree_node_t *)nleaf;
-	lock_node(nnode);
+	nleaf->version |= NODE_LOCKED;
 
 	/* Copy half of the keys. */
 	perm = leaf->permutation;
@@ -830,11 +828,13 @@ split_leaf_node(masstree_t *tree, mtree_node_t *node,
 		nleaf->lv[nidx] = leaf->lv[idx];
 		removed |= 1U << idx;
 	}
+	nleaf->version |= NODE_SPLITTING;
+	nleaf->permutation = PERM_SEQUENTIAL | (NODE_MAX - NODE_PIVOT);
+	atomic_thread_fence(memory_order_release);
 	nkey = nleaf->keyslice[0];
 
 	/*
-	 * Initialise the leaf (permutation, links, etc).  Notes on
-	 * updating the list pointers:
+	 * Notes on updating the list pointers:
 	 *
 	 * - Right-leaf (the new one) gets 'prev' and 'next' pointers set
 	 *   since both of the nodes are locked.
@@ -849,8 +849,6 @@ split_leaf_node(masstree_t *tree, mtree_node_t *node,
 	 *   right-leaf can also be updated since the original previous
 	 *   leaf is locked.
 	 */
-	nleaf->version |= NODE_SPLITTING;
-	nleaf->permutation = PERM_SEQUENTIAL | (NODE_MAX - NODE_PIVOT);
 	if ((nleaf->next = leaf->next) != NULL) {
 		mtree_leaf_t *next = nleaf->next;
 		next->prev = nleaf;
@@ -866,13 +864,11 @@ split_leaf_node(masstree_t *tree, mtree_node_t *node,
 	 */
 	leaf->version |= NODE_SPLITTING;
 	atomic_thread_fence(memory_order_release);
-
 	leaf->permutation -= (NODE_MAX - NODE_PIVOT);
-	leaf->removed |= removed;
+	leaf->removed |= removed; // XXX
 
 	toright = key_geq(nleaf, key, KEY_LLEN(len));
-	keynode = toright ? nnode : node;
-	leaf_insert_key(keynode, key, len, val);
+	leaf_insert_key(toright ? nnode : node, key, len, val);
 	leaf->next = nleaf;
 
 	NOSMP_ASSERT(validate_leaf(leaf));
@@ -902,7 +898,7 @@ ascend:
 		atomic_thread_fence(memory_order_release);
 
 		ASSERT(node->version & (NODE_SPLITTING | NODE_INSERTING));
-		ASSERT(node->version & NODE_ISROOT);
+		// XXX ASSERT(node->version & NODE_ISROOT);
 		ASSERT(node_get_parent(node) == NULL);
 		ASSERT(node_get_parent(nnode) == NULL);
 
@@ -963,7 +959,7 @@ ascend:
 
 /*
  * collapse_nodes: collapse the intermediate nodes and indicate whether
- * the whole layer should be collapsed (true) or not (false).
+ * the the upper layer needs cleanup/fixup (true) or not (false).
  */
 static bool
 collapse_nodes(masstree_t *tree, mtree_node_t *node, uint64_t key)
@@ -1011,7 +1007,6 @@ collapse_nodes(masstree_t *tree, mtree_node_t *node, uint64_t key)
 		unsigned i;
 
 		NOSMP_ASSERT(validate_inode(pnode));
-		unlock_gc_node(tree, node);
 
 		/* Assign the child, set its parent pointer. */
 		for (i = 0; i < pnode->nkeys; i++)
@@ -1019,6 +1014,7 @@ collapse_nodes(masstree_t *tree, mtree_node_t *node, uint64_t key)
 				break;
 		pnode->child[i] = child;
 		node_set_parent(child, pnode);
+		unlock_gc_node(tree, node);
 		NOSMP_ASSERT(validate_inode(pnode));
 		unlock_node(parent);
 		return false;
@@ -1040,8 +1036,6 @@ collapse_nodes(masstree_t *tree, mtree_node_t *node, uint64_t key)
 #if 0
 	node_set_parent(node, (mtree_inode_t *)child);
 	atomic_thread_fence(memory_order_release);
-
-	child->version |= NODE_ISROOT; // XXX
 	node_set_parent(child, NULL);
 	unlock_gc_node(tree, node);
 #else
@@ -1388,8 +1382,8 @@ newlayer:
 		mtree_leaf_t *nlayer;
 
 		nlayer = leaf_create(tree);
-		nlayer->version |= NODE_INSERTING | NODE_ISROOT;
-		lock_node((mtree_node_t *)nlayer);
+		nlayer->version |= NODE_LOCKED | NODE_INSERTING | NODE_ISROOT;
+		atomic_thread_fence(memory_order_release);
 		root = sval = nlayer;
 	}
 
@@ -1487,6 +1481,13 @@ delayer:
 				slen = (slen & ~MTREE_VALUE) | MTREE_LAYER;
 				goto delayer;
 			}
+#if 0
+			lock_node(root);
+			if (node_get_parent(root) == NULL) {
+				root->version |= NODE_ISROOT;
+			}
+			unlock_node(root);
+#endif
 			return true;
 		}
 		unlock_node(node);
@@ -1519,7 +1520,11 @@ masstree_gc(masstree_t *tree, void *gc)
 
 	while (node) {
 		ASSERT((node->version & NODE_DELETED) != 0);
-		next = node->gc_next;
+		if (node->version & NODE_ISBORDER) {
+			next = cast_to_leaf(node)->gc_next;
+		} else {
+			next = cast_to_inode(node)->gc_next;
+		}
 		if (node != (mtree_node_t *)&tree->initleaf) {
 			ops->free(node, (node->version & NODE_ISBORDER) ?
 			    sizeof(mtree_leaf_t) : sizeof(mtree_inode_t));

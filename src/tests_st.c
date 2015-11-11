@@ -143,11 +143,13 @@ random_keyval_test(void)
 static void
 random_del_test(void)
 {
-	masstree_t *tree = masstree_create(NULL);
 	unsigned n = 100, nitems = 1000;
 	uint64_t keys[nitems];
 
 	while (--n) {
+		masstree_t *tree = masstree_create(NULL);
+		void *ref;
+
 		srandom(n);
 		for (unsigned i = 0; i < nitems; i++) {
 			keys[i] = random();
@@ -159,7 +161,53 @@ random_del_test(void)
 			bool ok = masstree_del(tree, pkey, sizeof(uint64_t));
 			assert(ok);
 		}
+
+		ref = masstree_gc_prepare(tree);
+		masstree_gc(tree, ref);
+		masstree_destroy(tree);
 	}
+}
+
+static void
+seq_del_test(void)
+{
+	masstree_t *tree = masstree_create(NULL);
+	unsigned nitems = 0x1f;
+	void *ref;
+
+	for (unsigned i = 0; i < nitems; i++) {
+		uint64_t key = i;
+		masstree_put(tree, &key, sizeof(uint64_t), (void *)0x1);
+	}
+	for (unsigned i = 0; i < nitems; i++) {
+		uint64_t key = i;
+		bool ok = masstree_del(tree, &key, sizeof(uint64_t));
+		assert(ok);
+	}
+	ref = masstree_gc_prepare(tree);
+	masstree_gc(tree, ref);
+	masstree_destroy(tree);
+}
+
+static void
+invseq_del_test(void)
+{
+	masstree_t *tree = masstree_create(NULL);
+	unsigned nitems = 0x1f;
+	void *ref;
+
+	for (unsigned i = 0; i < nitems; i++) {
+		uint64_t key = i;
+		masstree_put(tree, &key, sizeof(uint64_t), (void *)0x2);
+	}
+	for (unsigned i = 0; i < nitems; i++) {
+		uint64_t key = nitems - i - 1;
+		bool ok = masstree_del(tree, &key, sizeof(uint64_t));
+		assert(ok);
+	}
+	ref = masstree_gc_prepare(tree);
+	masstree_gc(tree, ref);
+	masstree_destroy(tree);
 }
 
 int
@@ -171,6 +219,8 @@ main(void)
 
 	random_keyval_test();
 	random_del_test();
+	seq_del_test();
+	invseq_del_test();
 
 	puts("ok");
 	return 0;
