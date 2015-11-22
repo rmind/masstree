@@ -133,7 +133,7 @@ random_keyval_test(void)
 			pval = masstree_get(tree, pkey, sizeof(key));
 
 			if ((unsigned long)(uintptr_t)pval != val) {
-				printf("%llx, %llx, %u\n", val, key, n - i);
+				printf("%lx, %lx, %zu\n", val, key, n - i);
 				abort();
 			}
 		}

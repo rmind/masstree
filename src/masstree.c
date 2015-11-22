@@ -935,11 +935,11 @@ ascend:
 		inode = split_inter_node(tree, parent, nkey, nnode, &nkey);
 		unlock_node(nnode);
 
+		ASSERT(node_locked_p(parent));
+		ASSERT(node_locked_p(inode));
+
 		node = parent;
 		nnode = inode;
-
-		ASSERT(node_locked_p(nnode));
-		ASSERT(node_locked_p(node));
 		goto ascend;
 	}
 
@@ -965,7 +965,7 @@ static bool
 collapse_nodes(masstree_t *tree, mtree_node_t *node, uint64_t key)
 {
 	mtree_node_t *parent, *child = NULL;
-	bool sublayer = true;
+	bool toproot;
 
 	ASSERT(node->version & NODE_DELETED);
 	ASSERT(tree->root != node);
@@ -976,8 +976,8 @@ collapse_nodes(masstree_t *tree, mtree_node_t *node, uint64_t key)
 	 * flag and indicate that the upper layer needs a cleanup.
 	 */
 	if ((parent = lock_parent_node(node)) == NULL) {
-		ASSERT(node->version & NODE_ISROOT);
-		node->version = (node->version & ~NODE_DELAYER) | NODE_DELAYER;
+		//ASSERT(node->version & NODE_ISROOT);
+		node->version = (node->version & ~NODE_DELETED) | NODE_DELAYER;
 		unlock_gc_node(tree, node);
 		return true;
 	}
@@ -1002,6 +1002,7 @@ collapse_nodes(masstree_t *tree, mtree_node_t *node, uint64_t key)
 	 */
 	parent->version |= NODE_DELETED;
 	node = parent;
+
 	if ((parent = lock_parent_node(node)) != NULL) {
 		mtree_inode_t *pnode = cast_to_inode(parent);
 		unsigned i;
@@ -1012,9 +1013,11 @@ collapse_nodes(masstree_t *tree, mtree_node_t *node, uint64_t key)
 		for (i = 0; i < pnode->nkeys; i++)
 			if (key < pnode->keyslice[i])
 				break;
+		ASSERT(pnode->child[i] == node);
 		pnode->child[i] = child;
 		node_set_parent(child, pnode);
 		unlock_gc_node(tree, node);
+
 		NOSMP_ASSERT(validate_inode(pnode));
 		unlock_node(parent);
 		return false;
@@ -1031,29 +1034,19 @@ collapse_nodes(masstree_t *tree, mtree_node_t *node, uint64_t key)
 	 *   just been marked as deleted.  At this point, concurrent
 	 *   split or deletion of the child itself may happen.
 	 */
-	ASSERT(node->version & NODE_ISROOT);
-	node->version &= ~NODE_ISROOT;
-#if 0
+	//ASSERT(node->version & NODE_ISROOT);
+	node->version = (node->version & ~NODE_ISROOT) | NODE_DELETED;
 	node_set_parent(node, (mtree_inode_t *)child);
+	toproot = (tree->root == node);
+	if (toproot) {
+		tree->root = child;
+	}
 	atomic_thread_fence(memory_order_release);
 	node_set_parent(child, NULL);
 	unlock_gc_node(tree, node);
-#else
-	node_set_parent(child, NULL);
-	unlock_gc_node(tree, node);
-
-	lock_node(child);
-	child->version |= NODE_ISROOT; // XXX
-	node_set_parent(node, (mtree_inode_t *)child);
-	unlock_node(child);
-#endif
-	if (tree->root == node) {
-		tree->root = child;
-		return false;
-	}
 
 	/* Indicate that the upper layer needs a clean up. */
-	return true;
+	return !toproot;
 }
 
 /*
@@ -1081,7 +1074,7 @@ delete_leaf_node(masstree_t *tree, mtree_node_t *node, uint64_t key)
 	 */
 	if (tree->root == node) {
 		ASSERT(node_get_parent(node) == NULL);
-		ASSERT(node->version & NODE_ISROOT);
+		//ASSERT(node->version & NODE_ISROOT);
 		unlock_node(node);
 		return false;
 	}
@@ -1154,8 +1147,8 @@ retry:
 
 	/* Handle stale roots which can occur due to splits. */
 	if (__predict_false((v & NODE_ISROOT) == 0)) {
-		root = walk_to_root(node);
-		goto retry;
+		root = node = walk_to_root(node);
+		v = stable_version(node);
 	}
 
 	/*
@@ -1519,14 +1512,17 @@ masstree_gc(masstree_t *tree, void *gc)
 	mtree_node_t *node = gc, *next;
 
 	while (node) {
-		ASSERT((node->version & NODE_DELETED) != 0);
-		if (node->version & NODE_ISBORDER) {
+		const uint32_t v = node->version;
+
+		ASSERT((v & (NODE_DELETED | NODE_DELAYER)) != 0);
+
+		if (v & NODE_ISBORDER) {
 			next = cast_to_leaf(node)->gc_next;
 		} else {
 			next = cast_to_inode(node)->gc_next;
 		}
 		if (node != (mtree_node_t *)&tree->initleaf) {
-			ops->free(node, (node->version & NODE_ISBORDER) ?
+			ops->free(node, (v & NODE_ISBORDER) ?
 			    sizeof(mtree_leaf_t) : sizeof(mtree_inode_t));
 		}
 		node = next;
