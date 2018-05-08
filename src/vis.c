@@ -131,7 +131,7 @@ main(int argc, char **argv)
 		}
 		if (strcmp(p[0], "GET") == 0) {
 			valp = masstree_get(tree, key, strlen(key));
-			printf("%lu\n", (unsigned)(uintptr_t)valp);
+			printf("%lu\n", (unsigned long)(uintptr_t)valp);
 		}
 		if (strcmp(p[0], "DEL") == 0) {
 			masstree_del(tree, key, strlen(key));
