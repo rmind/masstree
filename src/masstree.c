@@ -49,20 +49,20 @@
  *   the readers (which would spin retrying);
  *
  *   ii) the node destruction must be synchronised with the readers, e.g.
- *   by using Epoch-based reclamation or techniques.
+ *   by using Epoch-based reclamation or other techniques.
  *
  * - WRITERS: Fine-grained locking is used, i.e. any modifications to a
  *   node must acquire per-node spinlock (NODE_LOCKED bit) which provides
  *   mutual exclusion amongst concurrent writers.  Modifications to the
  *   node preserve consistency using a permutation stored in a 64-bit word.
- *   Otherwise, NODE_INSERTING bit marks the node as "dirty" and fails the
- *   readers until the modification is complete.
+ *   Otherwise, the NODE_INSERTING bit marks the node as "dirty" and fails
+ *   the readers until the modification is complete.
  *
  * - SPLITS: Performed by locking the node, its sibling and its parent,
  *   as well as setting the NODE_SPLITTING bit to indicate that the node
  *   is "dirty" and that the tree shape is changing: this ensures that
  *   the readers either a) retry from the root b) use walk_leaves() to
- *   find check the split leaves on the right side.
+ *   find the split leaves on the right hand side.
  *
  * - ROOT CHANGE AND LAYERING: The tree within a layer may: a) get a new
  *   root due to a split or collapse  b) be entirely collapsed and thus
@@ -309,7 +309,7 @@ stable_version(mtree_node_t *node)
 		SPINLOCK_BACKOFF(bcount);
 		v = node->version;
 	}
-	atomic_thread_fence(memory_order_acquire);
+	atomic_thread_fence(memory_order_seq_cst);
 	return v;
 }
 
@@ -334,7 +334,7 @@ again:
 		goto again;
 
 	/* XXX: Use atomic_compare_exchange_weak_explicit() instead. */
-	atomic_thread_fence(memory_order_acquire);
+	atomic_thread_fence(memory_order_seq_cst);
 }
 
 static void
@@ -362,7 +362,7 @@ unlock_node(mtree_node_t *node)
 	v &= ~(NODE_LOCKED | NODE_INSERTING | NODE_SPLITTING);
 
 	/* Note: store on an integer is atomic. */
-	atomic_thread_fence(memory_order_release);
+	atomic_thread_fence(memory_order_seq_cst);
 	node->version = v;
 }
 
@@ -548,7 +548,7 @@ leaf_insert_key(mtree_node_t *node, uint64_t key, unsigned kinfo, void *val)
 		 * the detailed description.
 		 */
 		node->version |= NODE_INSERTING;
-		atomic_thread_fence(memory_order_release);
+		atomic_thread_fence(memory_order_seq_cst);
 	} else {
 		/* No removals: just pick the next slot. */
 		slot = nkeys;
@@ -581,7 +581,7 @@ leaf_insert_key(mtree_node_t *node, uint64_t key, unsigned kinfo, void *val)
 
 	/* Set the value pointer.  It must become visible first. */
 	leaf->lv[slot] = val;
-	atomic_thread_fence(memory_order_release);
+	atomic_thread_fence(memory_order_seq_cst);
 
 	/* Atomically store the new permutation. */
 	leaf->permutation = nperm;
@@ -628,7 +628,7 @@ leaf_remove_key(mtree_node_t *node, uint64_t key, unsigned len)
 	}
 	leaf->removed |= 1U << idx;
 	leaf->permutation = nperm;
-	atomic_thread_fence(memory_order_release);
+	atomic_thread_fence(memory_order_seq_cst);
 
 	/* Indicate whether it was the last key. */
 	return (nkeys - 1) == 0;
@@ -692,7 +692,7 @@ internode_insert(mtree_node_t *node, uint64_t key, mtree_node_t *child)
 	inode->keyslice[i] = key;
 	inode->child[i + 1] = child;
 	node_set_parent(child, inode);
-	atomic_thread_fence(memory_order_release);
+	atomic_thread_fence(memory_order_seq_cst);
 
 	inode->nkeys++;
 	NOSMP_ASSERT(validate_inode(inode));
@@ -774,7 +774,7 @@ split_inter_node(masstree_t *tree, mtree_node_t *parent, uint64_t ckey,
 	 * Note the extra decrement in order to remove the pivot.
 	 */
 	lnode->version |= NODE_SPLITTING;
-	atomic_thread_fence(memory_order_release);
+	atomic_thread_fence(memory_order_seq_cst);
 	lnode->nkeys = s - 1;
 
 	/* Insert the child into the correct parent. */
@@ -830,7 +830,7 @@ split_leaf_node(masstree_t *tree, mtree_node_t *node,
 	}
 	nleaf->version |= NODE_SPLITTING;
 	nleaf->permutation = PERM_SEQUENTIAL | (NODE_MAX - NODE_PIVOT);
-	atomic_thread_fence(memory_order_release);
+	atomic_thread_fence(memory_order_seq_cst);
 	nkey = nleaf->keyslice[0];
 
 	/*
@@ -863,7 +863,7 @@ split_leaf_node(masstree_t *tree, mtree_node_t *node,
 	 * - Update the 'next' pointer of the original leaf.
 	 */
 	leaf->version |= NODE_SPLITTING;
-	atomic_thread_fence(memory_order_release);
+	atomic_thread_fence(memory_order_seq_cst);
 	leaf->permutation -= (NODE_MAX - NODE_PIVOT);
 	leaf->removed |= removed; // XXX
 
@@ -895,7 +895,7 @@ ascend:
 		pnode->child[0] = node;
 		pnode->child[1] = nnode;
 		pnode->nkeys = 1;
-		atomic_thread_fence(memory_order_release);
+		atomic_thread_fence(memory_order_seq_cst);
 
 		ASSERT(node->version & (NODE_SPLITTING | NODE_INSERTING));
 		// XXX ASSERT(node->version & NODE_ISROOT);
@@ -986,7 +986,7 @@ collapse_nodes(masstree_t *tree, mtree_node_t *node, uint64_t key)
 	/* Fail the readers by pretending the insertion. */
 	ASSERT((parent->version & NODE_DELETED) == 0);
 	parent->version |= NODE_INSERTING;
-	atomic_thread_fence(memory_order_release);
+	atomic_thread_fence(memory_order_seq_cst);
 
 	/* Remove the key from the parent node. */
 	if ((child = internode_remove(parent, key)) == NULL) {
@@ -1041,7 +1041,7 @@ collapse_nodes(masstree_t *tree, mtree_node_t *node, uint64_t key)
 	if (toproot) {
 		tree->root = child;
 	}
-	atomic_thread_fence(memory_order_release);
+	atomic_thread_fence(memory_order_seq_cst);
 	node_set_parent(child, NULL);
 	unlock_gc_node(tree, node);
 
@@ -1095,7 +1095,7 @@ delete_leaf_node(masstree_t *tree, mtree_node_t *node, uint64_t key)
 		unlock_node(next);
 	}
 	node->version |= NODE_DELETED;
-	atomic_thread_fence(memory_order_release);
+	atomic_thread_fence(memory_order_seq_cst);
 
 	/*
 	 * Get a stable version of the previous node and attempt to
@@ -1176,7 +1176,7 @@ retry:
 		}
 
 		/*
-		 * If the split was performed - the hierarchy might have
+		 * If a split occurred, then the hierarchy might have
 		 * been disrupted and we have to retry from the root.
 		 */
 		nv = stable_version(node);
@@ -1274,7 +1274,7 @@ masstree_get(masstree_t *tree, const void *key, size_t len)
 advance:
 	/*
 	 * Fetch a slice (64-bit word), iterating layers.  Note: sets
-	 * the MTREE_LAYER flag on slice-lenth if looking for a later.
+	 * the MTREE_LAYER flag on slice-length if looking for a later.
 	 */
 	skey = fetch_word64(key, len, &l, &slen);
 retry:
@@ -1289,7 +1289,7 @@ forward:
 	/* Fetch the value (or pointer to the next layer). */
 	idx = leaf_find_lv(leaf, skey, slen, &type);
 	lv = leaf->lv[idx];
-	atomic_thread_fence(memory_order_acquire);
+	atomic_thread_fence(memory_order_seq_cst);
 
 	/* Check that the version has not changed. */
 	if (__predict_false((leaf->version ^ v) > NODE_LOCKED)) {
@@ -1359,7 +1359,8 @@ advance:
 		 */
 		root = leaf->lv[idx];
 		if ((root->version & NODE_ISROOT) == 0) {
-			root = leaf->lv[idx] = walk_to_root(root);
+			root = walk_to_root(root);
+			leaf->lv[idx] = root;
 		}
 		unlock_node(node);
 		goto advance;
@@ -1376,7 +1377,7 @@ newlayer:
 
 		nlayer = leaf_create(tree);
 		nlayer->version |= NODE_LOCKED | NODE_INSERTING | NODE_ISROOT;
-		atomic_thread_fence(memory_order_release);
+		atomic_thread_fence(memory_order_seq_cst);
 		root = sval = nlayer;
 	}
 
@@ -1499,7 +1500,13 @@ delayer:
 void *
 masstree_gc_prepare(masstree_t *tree)
 {
-	return atomic_exchange(&tree->gc_nodes, NULL);
+	mtree_node_t *gc_nodes = NULL;
+
+	do {
+		gc_nodes = tree->gc_nodes;
+	} while (!atomic_compare_exchange_weak(&tree->gc_nodes, gc_nodes, NULL));
+
+	return gc_nodes;
 }
 
 /*
@@ -1537,7 +1544,8 @@ masstree_create(const masstree_ops_t *ops)
 
 	if (ops == NULL) {
 		static const masstree_ops_t default_ops = {
-			.alloc = malloc, .free = __masstree_free_wrapper
+			.alloc = malloc,
+			.free = __masstree_free_wrapper
 		};
 		ops = &default_ops;
 	}
@@ -1549,7 +1557,7 @@ masstree_create(const masstree_ops_t *ops)
 	root->version = NODE_ISROOT | NODE_ISBORDER;
 	tree->root = root;
 
-	atomic_thread_fence(memory_order_release);
+	atomic_thread_fence(memory_order_seq_cst);
 	return tree;
 }
 
