@@ -12,3 +12,6 @@ risk.  Support is not provided at this stage.
 - The concurrent delete operation is known to have bugs.
 - Certain optimisations and features from the original paper are not
 implemented.
+
+**NOTE**: For a stable alternative, please see the
+[concurrent trie-hash map](https://github.com/rmind/thmap) project.
